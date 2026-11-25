@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.python-version
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+.workbuddy/
+
+# Runtime
+logs/*.log
+logs/*
+!logs/.gitkeep
+output/*
+!output/.gitkeep
+archive/logs/*
+!archive/logs/.gitkeep
+data/*.db
+data/*.db-*
+!data/.gitkeep
+
+# Keep data directory structure, ignore temp
+*.tmp
+*.bak
+*.log

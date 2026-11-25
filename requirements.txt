@@ -1,0 +1,8 @@
+# PCB 智能品质分析系统依赖
+pyodbc>=5.0.0
+pymysql>=1.1.0
+reportlab>=4.0.0
+openpyxl>=3.1.0
+
+# 可选：读取 ERP PDF 调试工具
+pdfplumber>=0.11.0

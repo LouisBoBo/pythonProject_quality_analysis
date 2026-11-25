@@ -1,0 +1,1264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>产品全流程追溯系统 - 设计预览</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+        .header {
+            background: rgba(0,0,0,0.3);
+            padding: 20px 40px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .header h1 {
+            color: #00d4ff;
+            font-size: 24px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .header h1::before {
+            content: "🔍";
+        }
+        .header p {
+            color: #888;
+            margin-top: 5px;
+            font-size: 14px;
+        }
+        
+        .container {
+            display: flex;
+            min-height: calc(100vh - 80px);
+        }
+        
+        /* 左侧导航 */
+        .sidebar {
+            width: 200px;
+            background: rgba(0,0,0,0.2);
+            padding: 20px 0;
+            border-right: 1px solid rgba(255,255,255,0.1);
+        }
+        .nav-item {
+            padding: 15px 25px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-left: 3px solid transparent;
+        }
+        .nav-item:hover {
+            background: rgba(0,212,255,0.1);
+        }
+        .nav-item.active {
+            background: rgba(0,212,255,0.15);
+            border-left-color: #00d4ff;
+            color: #00d4ff;
+        }
+        .nav-item .icon {
+            font-size: 18px;
+        }
+        
+        /* 主内容区 */
+        .main {
+            flex: 1;
+            padding: 25px;
+            overflow-y: auto;
+        }
+        
+        /* 查询区域 */
+        .query-panel {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 25px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .query-row {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .query-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .query-item label {
+            color: #888;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+        .query-item input, .query-item select {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 6px;
+            padding: 8px 12px;
+            color: #fff;
+            font-size: 14px;
+            min-width: 150px;
+        }
+        .query-item input:focus, .query-item select:focus {
+            outline: none;
+            border-color: #00d4ff;
+        }
+        .btn {
+            padding: 10px 25px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0,212,255,0.3);
+        }
+        .btn-secondary {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .btn-secondary:hover {
+            background: rgba(255,255,255,0.2);
+        }
+        
+        /* 统计卡片 */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+            position: relative;
+            overflow: hidden;
+        }
+        .stat-card::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+        }
+        .stat-card.blue::before { background: #00d4ff; }
+        .stat-card.green::before { background: #00ff88; }
+        .stat-card.orange::before { background: #ff9f43; }
+        .stat-card.red::before { background: #ff6b6b; }
+        
+        .stat-card .label {
+            color: #888;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #fff;
+        }
+        .stat-card .sub {
+            color: #666;
+            font-size: 12px;
+            margin-top: 5px;
+        }
+        .stat-card .trend {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            font-size: 12px;
+            padding: 3px 8px;
+            border-radius: 10px;
+        }
+        .trend.up { background: rgba(0,255,136,0.2); color: #00ff88; }
+        .trend.down { background: rgba(255,107,107,0.2); color: #ff6b6b; }
+        
+        /* 图表区域 */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+        .chart-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .chart-card h3 {
+            color: #fff;
+            font-size: 16px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .chart-container {
+            height: 280px;
+        }
+        
+        /* 数据表格 */
+        .data-table {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.1);
+            overflow: hidden;
+        }
+        .table-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .table-header h3 {
+            color: #fff;
+            font-size: 16px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        th {
+            background: rgba(0,0,0,0.2);
+            color: #888;
+            font-weight: 500;
+            font-size: 13px;
+        }
+        td {
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+        tr:hover td {
+            background: rgba(0,212,255,0.05);
+        }
+        .badge {
+            padding: 3px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+        }
+        .badge-success { background: rgba(0,255,136,0.2); color: #00ff88; }
+        .badge-warning { background: rgba(255,159,67,0.2); color: #ff9f43; }
+        .badge-danger { background: rgba(255,107,107,0.2); color: #ff6b6b; }
+        
+        /* 模块切换动画 */
+        .module-content {
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }
+        .module-content.active {
+            display: block;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* 进度指示器 */
+        .progress-bar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 25px;
+        }
+        .progress-item {
+            flex: 1;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 12px 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: 1px solid transparent;
+        }
+        .progress-item:hover {
+            background: rgba(0,212,255,0.1);
+        }
+        .progress-item.active {
+            border-color: #00d4ff;
+            background: rgba(0,212,255,0.1);
+        }
+        .progress-item.completed {
+            border-color: #00ff88;
+        }
+        .progress-item.completed .step-num {
+            background: #00ff88;
+        }
+        .step-num {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: bold;
+        }
+        .progress-item.active .step-num {
+            background: #00d4ff;
+            color: #000;
+        }
+        .step-info {
+            flex: 1;
+        }
+        .step-info .title {
+            color: #fff;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .step-info .desc {
+            color: #666;
+            font-size: 12px;
+        }
+        .progress-item.active .step-info .title {
+            color: #00d4ff;
+        }
+        
+        /* 流程图 */
+        .flow-container {
+            background: rgba(255,255,255,0.03);
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 25px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .flow-row {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        .flow-node {
+            background: rgba(0,212,255,0.1);
+            border: 1px solid rgba(0,212,255,0.3);
+            border-radius: 8px;
+            padding: 12px 20px;
+            color: #00d4ff;
+            font-size: 13px;
+            position: relative;
+        }
+        .flow-node.active {
+            background: rgba(0,212,255,0.2);
+            border-color: #00d4ff;
+            box-shadow: 0 0 20px rgba(0,212,255,0.3);
+        }
+        .flow-arrow {
+            color: #444;
+            font-size: 20px;
+        }
+        
+        /* 详情卡片 */
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .detail-item {
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            padding: 12px;
+        }
+        .detail-item .label {
+            color: #666;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        .detail-item .value {
+            color: #fff;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>产品全流程追溯系统 - 设计预览</h1>
+        <p>四大模块: 精确查询 | MRB分析 | MES数据 | 物料追溯</p>
+    </div>
+    
+    <div class="container">
+        <!-- 左侧导航 -->
+        <div class="sidebar">
+            <div class="nav-item active" onclick="switchModule('overview')">
+                <span class="icon">📋</span>
+                <span>工单概览</span>
+            </div>
+            <div class="nav-item" onclick="switchModule('mrb')">
+                <span class="icon">📊</span>
+                <span>MRB分析</span>
+            </div>
+            <div class="nav-item" onclick="switchModule('mes')">
+                <span class="icon">🔧</span>
+                <span>MES数据</span>
+            </div>
+            <div class="nav-item" onclick="switchModule('material')">
+                <span class="icon">🧪</span>
+                <span>物料追溯</span>
+            </div>
+        </div>
+        
+        <!-- 主内容 -->
+        <div class="main">
+            <!-- 查询面板 -->
+            <div class="query-panel">
+                <div class="query-row">
+                    <div class="query-item">
+                        <label>料号:</label>
+                        <input type="text" placeholder="输入料号..." value="B60P04L11717A0">
+                    </div>
+                    <div class="query-item">
+                        <label>订单号:</label>
+                        <input type="text" placeholder="订单号">
+                    </div>
+                    <div class="query-item">
+                        <label>工单号:</label>
+                        <input type="text" placeholder="工单号">
+                    </div>
+                    <div class="query-item">
+                        <label>生产日期:</label>
+                        <input type="date" value="2026-04-01">
+                        <span>~</span>
+                        <input type="date" value="2026-04-14">
+                    </div>
+                    <button class="btn btn-primary" onclick="refreshData()">🔍 追溯查询</button>
+                    <button class="btn btn-secondary">⚙️ 高级筛选</button>
+                </div>
+            </div>
+            
+            <!-- 进度指示器 -->
+            <div class="progress-bar">
+                <div class="progress-item active">
+                    <div class="step-num">1</div>
+                    <div class="step-info">
+                        <div class="title">精确查询</div>
+                        <div class="desc">按日期/订单/周期筛选</div>
+                    </div>
+                </div>
+                <div class="progress-item">
+                    <div class="step-num">2</div>
+                    <div class="step-info">
+                        <div class="title">MRB分析</div>
+                        <div class="desc">报废缺陷/责任工序</div>
+                    </div>
+                </div>
+                <div class="progress-item">
+                    <div class="step-num">3</div>
+                    <div class="step-info">
+                        <div class="title">MES数据</div>
+                        <div class="desc">设备/参数/良率</div>
+                    </div>
+                </div>
+                <div class="progress-item">
+                    <div class="step-num">4</div>
+                    <div class="step-info">
+                        <div class="title">物料追溯</div>
+                        <div class="desc">原料批次追踪</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 模块一：工单概览 -->
+            <div id="module-overview" class="module-content active">
+                <!-- 统计卡片 -->
+                <div class="stats-grid">
+                    <div class="stat-card blue">
+                        <div class="label">工单数量</div>
+                        <div class="value">12</div>
+                        <div class="sub">本周期内活跃工单</div>
+                        <div class="trend up">↑ 3</div>
+                    </div>
+                    <div class="stat-card green">
+                        <div class="label">生产批次</div>
+                        <div class="value">48</div>
+                        <div class="sub">已完成 + 进行中</div>
+                        <div class="trend up">↑ 8</div>
+                    </div>
+                    <div class="stat-card orange">
+                        <div class="label">投入面积</div>
+                        <div class="value">1,542</div>
+                        <div class="sub">m² (平方米)</div>
+                    </div>
+                    <div class="stat-card red">
+                        <div class="label">报废率</div>
+                        <div class="value">2.3%</div>
+                        <div class="sub">报废/入库面积</div>
+                        <div class="trend down">↓ 0.5%</div>
+                    </div>
+                </div>
+                
+                <!-- 图表 -->
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>📈 周期产量趋势</h3>
+                        <div class="chart-container" id="chart-trend"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>🥧 工序分布</h3>
+                        <div class="chart-container" id="chart-process"></div>
+                    </div>
+                </div>
+                
+                <!-- 流程图 -->
+                <div class="flow-container">
+                    <h3 style="color:#fff;margin-bottom:20px;">工艺流程追溯链路</h3>
+                    <div class="flow-row">
+                        <div class="flow-node active">开料到钻孔</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">沉铜板镀</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">外层线路</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">图电蚀刻</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">阻焊文字</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">表面处理</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">成型锣边</div>
+                        <span class="flow-arrow">→</span>
+                        <div class="flow-node">终检包装</div>
+                    </div>
+                </div>
+                
+                <!-- 工单表格 -->
+                <div class="data-table">
+                    <div class="table-header">
+                        <h3>工单明细</h3>
+                        <button class="btn btn-secondary">导出Excel</button>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>工单号</th>
+                                <th>料号</th>
+                                <th>批次</th>
+                                <th>投入面积</th>
+                                <th>良品面积</th>
+                                <th>报废面积</th>
+                                <th>开工日期</th>
+                                <th>状态</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>WO2026040101</td>
+                                <td>B60P04L11717A0</td>
+                                <td>Lot-001</td>
+                                <td>125 m²</td>
+                                <td>121 m²</td>
+                                <td>4 m²</td>
+                                <td>2026-04-01</td>
+                                <td><span class="badge badge-success">已完成</span></td>
+                            </tr>
+                            <tr>
+                                <td>WO2026040201</td>
+                                <td>B60P04L11717A0</td>
+                                <td>Lot-002</td>
+                                <td>136 m²</td>
+                                <td>133 m²</td>
+                                <td>3 m²</td>
+                                <td>2026-04-02</td>
+                                <td><span class="badge badge-success">已完成</span></td>
+                            </tr>
+                            <tr>
+                                <td>WO2026041001</td>
+                                <td>B60P04L11717A0</td>
+                                <td>Lot-003</td>
+                                <td>98 m²</td>
+                                <td>96 m²</td>
+                                <td>2 m²</td>
+                                <td>2026-04-10</td>
+                                <td><span class="badge badge-warning">进行中</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- 模块二：MRB分析 -->
+            <div id="module-mrb" class="module-content">
+                <div class="stats-grid">
+                    <div class="stat-card red">
+                        <div class="label">报废总面积</div>
+                        <div class="value">35.6</div>
+                        <div class="sub">m²</div>
+                    </div>
+                    <div class="stat-card blue">
+                        <div class="label">报废率</div>
+                        <div class="value">2.3%</div>
+                        <div class="sub">行业标杆: &lt;1.5%</div>
+                    </div>
+                    <div class="stat-card green">
+                        <div class="label">返修总面积</div>
+                        <div class="value">8.2</div>
+                        <div class="sub">m²</div>
+                    </div>
+                    <div class="stat-card orange">
+                        <div class="label">MRB单数</div>
+                        <div class="value">24</div>
+                        <div class="sub">本月评审单</div>
+                    </div>
+                </div>
+                
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>🔺 报废缺陷TOP10（柏拉图）</h3>
+                        <div class="chart-container" id="chart-defect"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>🥧 责任工序分布</h3>
+                        <div class="chart-container" id="chart-respon"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>📈 报废率月度趋势</h3>
+                        <div class="chart-container" id="chart-scrap-trend"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>📊 报废类型构成</h3>
+                        <div class="chart-container" id="chart-scrap-type"></div>
+                    </div>
+                </div>
+                
+                <div class="data-table">
+                    <div class="table-header">
+                        <h3>报废缺陷明细</h3>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>缺陷类型</th>
+                                <th>缺陷数量</th>
+                                <th>占比</th>
+                                <th>累计占比</th>
+                                <th>责任工序</th>
+                                <th>主要责任部门</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>开路</td>
+                                <td>18</td>
+                                <td>28.6%</td>
+                                <td>28.6%</td>
+                                <td>蚀刻</td>
+                                <td>生产部</td>
+                            </tr>
+                            <tr>
+                                <td>短路</td>
+                                <td>15</td>
+                                <td>23.8%</td>
+                                <td>52.4%</td>
+                                <td>图电</td>
+                                <td>生产部</td>
+                            </tr>
+                            <tr>
+                                <td>缺口</td>
+                                <td>10</td>
+                                <td>15.9%</td>
+                                <td>68.3%</td>
+                                <td>成型</td>
+                                <td>生产部</td>
+                            </tr>
+                            <tr>
+                                <td>气泡</td>
+                                <td>8</td>
+                                <td>12.7%</td>
+                                <td>81.0%</td>
+                                <td>压合</td>
+                                <td>工程部</td>
+                            </tr>
+                            <tr>
+                                <td>其他</td>
+                                <td>12</td>
+                                <td>19.0%</td>
+                                <td>100%</td>
+                                <td>-</td>
+                                <td>-</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- 模块三：MES数据 -->
+            <div id="module-mes" class="module-content">
+                <div class="stats-grid">
+                    <div class="stat-card blue">
+                        <div class="label">工序数</div>
+                        <div class="value">15</div>
+                        <div class="sub">完整工艺流程</div>
+                    </div>
+                    <div class="stat-card green">
+                        <div class="label">平均良率</div>
+                        <div class="value">97.7%</div>
+                        <div class="sub">整体良率</div>
+                    </div>
+                    <div class="stat-card orange">
+                        <div class="label">设备利用率</div>
+                        <div class="value">85%</div>
+                        <div class="sub">OEE综合</div>
+                    </div>
+                    <div class="stat-card red">
+                        <div class="label">药水异常</div>
+                        <div class="value">3</div>
+                        <div class="sub">本月记录</div>
+                    </div>
+                </div>
+                
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>⏱️ 各工序周期时间（甘特图）</h3>
+                        <div class="chart-container" id="chart-gantt"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>📊 工序良率对比</h3>
+                        <div class="chart-container" id="chart-yield"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>📈 关键参数趋势（SPC）</h3>
+                        <div class="chart-container" id="chart-spc"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>🔧 设备状态分布</h3>
+                        <div class="chart-container" id="chart-equip"></div>
+                    </div>
+                </div>
+                
+                <div class="data-table">
+                    <div class="table-header">
+                        <h3>工序生产数据明细</h3>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>工序名称</th>
+                                <th>生产时间</th>
+                                <th>设备编号</th>
+                                <th>操作员</th>
+                                <th>投入PNL</th>
+                                <th>良品PNL</th>
+                                <th>良率</th>
+                                <th>备注</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>钻孔</td>
+                                <td>2026-04-01 08:30</td>
+                                <td>DR-001</td>
+                                <td>张三</td>
+                                <td>120</td>
+                                <td>118</td>
+                                <td>98.3%</td>
+                                <td>-</td>
+                            </tr>
+                            <tr>
+                                <td>沉铜板镀</td>
+                                <td>2026-04-01 10:15</td>
+                                <td>PTH-002</td>
+                                <td>李四</td>
+                                <td>118</td>
+                                <td>116</td>
+                                <td>98.3%</td>
+                                <td>-</td>
+                            </tr>
+                            <tr>
+                                <td>外层线路</td>
+                                <td>2026-04-01 14:20</td>
+                                <td>LDI-003</td>
+                                <td>王五</td>
+                                <td>116</td>
+                                <td>113</td>
+                                <td>97.4%</td>
+                                <td class="badge badge-warning">参数微调</td>
+                            </tr>
+                            <tr>
+                                <td>图电蚀刻</td>
+                                <td>2026-04-01 16:45</td>
+                                <td>ET-001</td>
+                                <td>赵六</td>
+                                <td>113</td>
+                                <td>108</td>
+                                <td>95.6%</td>
+                                <td>-</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- 模块四：物料追溯 -->
+            <div id="module-material" class="module-content">
+                <div class="stats-grid">
+                    <div class="stat-card blue">
+                        <div class="label">原料批次</div>
+                        <div class="value">8</div>
+                        <div class="sub">本期使用批次</div>
+                    </div>
+                    <div class="stat-card green">
+                        <div class="label">供应商数</div>
+                        <div class="value">3</div>
+                        <div class="sub">本期供应商</div>
+                    </div>
+                    <div class="stat-card orange">
+                        <div class="label">来料合格率</div>
+                        <div class="value">99.2%</div>
+                        <div class="sub">IQC检验</div>
+                    </div>
+                    <div class="stat-card red">
+                        <div class="label">追溯覆盖率</div>
+                        <div class="value">100%</div>
+                        <div class="sub">全流程可追溯</div>
+                    </div>
+                </div>
+                
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>🧪 供应商来料质量对比</h3>
+                        <div class="chart-container" id="chart-supplier"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>📦 原料使用分布</h3>
+                        <div class="chart-container" id="chart-material"></div>
+                    </div>
+                </div>
+                
+                <div class="data-table">
+                    <div class="table-header">
+                        <h3>物料追溯链路</h3>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>原料料号</th>
+                                <th>原料名称</th>
+                                <th>供应商</th>
+                                <th>来料批次</th>
+                                <th>到货日期</th>
+                                <th>IQC结论</th>
+                                <th>使用工单</th>
+                                <th>投料时间</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>CU-CL-001</td>
+                                <td>电解铜箔 18μm</td>
+                                <td>xxx铜业</td>
+                                <td>Batch-20260315</td>
+                                <td>2026-03-15</td>
+                                <td><span class="badge badge-success">合格</span></td>
+                                <td>WO2026040101</td>
+                                <td>2026-04-01 08:00</td>
+                            </tr>
+                            <tr>
+                                <td>RF-PR-002</td>
+                                <td>干膜光阻 20μm</td>
+                                <td>xxx化工</td>
+                                <td>Batch-20260328</td>
+                                <td>2026-03-28</td>
+                                <td><span class="badge badge-success">合格</span></td>
+                                <td>WO2026040101</td>
+                                <td>2026-04-01 09:30</td>
+                            </tr>
+                            <tr>
+                                <td>SB-SR-003</td>
+                                <td>绿油感光剂</td>
+                                <td>xxx化学</td>
+                                <td>Batch-20260402</td>
+                                <td>2026-04-02</td>
+                                <td><span class="badge badge-warning">让步接收</span></td>
+                                <td>WO2026040201</td>
+                                <td>2026-04-02 10:00</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 模块切换
+        function switchModule(module) {
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            event.target.closest('.nav-item').classList.add('active');
+            document.querySelectorAll('.module-content').forEach(m => m.classList.remove('active'));
+            document.getElementById('module-' + module).classList.add('active');
+        }
+        
+        // 模拟刷新数据
+        function refreshData() {
+            alert('开始追溯查询...\n\n实际系统将连接MES/ERP数据库进行查询');
+        }
+        
+        // 初始化图表
+        document.addEventListener('DOMContentLoaded', function() {
+            initTrendChart();
+            initProcessChart();
+            initDefectChart();
+            initResponChart();
+            initScrapTrendChart();
+            initScrapTypeChart();
+            initGanttChart();
+            initYieldChart();
+            initSPCChart();
+            initEquipChart();
+            initSupplierChart();
+            initMaterialChart();
+        });
+        
+        function initTrendChart() {
+            const chart = echarts.init(document.getElementById('chart-trend'));
+            chart.setOption({
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['投入面积', '产出面积'], textStyle: { color: '#888' } },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: {
+                    type: 'category',
+                    data: ['04-01', '04-02', '04-03', '04-04', '04-05', '04-06', '04-07'],
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888' }
+                },
+                yAxis: {
+                    type: 'value',
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888' },
+                    splitLine: { lineStyle: { color: '#222' } }
+                },
+                series: [
+                    {
+                        name: '投入面积',
+                        type: 'line',
+                        data: [180, 165, 190, 175, 200, 185, 170],
+                        smooth: true,
+                        lineStyle: { color: '#00d4ff', width: 2 },
+                        areaStyle: { color: 'rgba(0,212,255,0.1)' }
+                    },
+                    {
+                        name: '产出面积',
+                        type: 'line',
+                        data: [175, 160, 185, 170, 195, 180, 166],
+                        smooth: true,
+                        lineStyle: { color: '#00ff88', width: 2 },
+                        areaStyle: { color: 'rgba(0,255,136,0.1)' }
+                    }
+                ]
+            });
+        }
+        
+        function initProcessChart() {
+            const chart = echarts.init(document.getElementById('chart-process'));
+            chart.setOption({
+                tooltip: { trigger: 'item' },
+                legend: { orient: 'vertical', right: '5%', top: 'center', textStyle: { color: '#888' } },
+                series: [{
+                    type: 'pie',
+                    radius: ['40%', '70%'],
+                    center: ['35%', '50%'],
+                    avoidLabelOverlap: false,
+                    itemStyle: { borderRadius: 6, borderColor: '#1a1a2e', borderWidth: 2 },
+                    label: { show: false },
+                    emphasis: { label: { show: true, fontSize: 14, fontWeight: 'bold' } },
+                    data: [
+                        { value: 35, name: '钻孔', itemStyle: { color: '#00d4ff' } },
+                        { value: 25, name: '线路', itemStyle: { color: '#00ff88' } },
+                        { value: 18, name: '蚀刻', itemStyle: { color: '#ff9f43' } },
+                        { value: 12, name: '阻焊', itemStyle: { color: '#ff6b6b' } },
+                        { value: 10, name: '其他', itemStyle: { color: '#888' } }
+                    ]
+                }]
+            });
+        }
+        
+        function initDefectChart() {
+            const chart = echarts.init(document.getElementById('chart-defect'));
+            chart.setOption({
+                tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                legend: { data: ['缺陷数量', '累计占比'], textStyle: { color: '#888' } },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: {
+                    type: 'category',
+                    data: ['开路', '短路', '缺口', '气泡', '毛刺', '分层', '偏位', '其他'],
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888' }
+                },
+                yAxis: [
+                    { type: 'value', axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888' }, splitLine: { lineStyle: { color: '#222' } } },
+                    { type: 'value', max: 100, axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888', formatter: '{value}%' }, splitLine: { show: false } }
+                ],
+                series: [
+                    { name: '缺陷数量', type: 'bar', data: [18, 15, 10, 8, 5, 4, 3, 12], itemStyle: { color: '#ff6b6b' } },
+                    { name: '累计占比', type: 'line', yAxisIndex: 1, data: [28.6, 52.4, 68.3, 81.0, 89.0, 95.2, 100, 100], smooth: true, lineStyle: { color: '#00d4ff' } }
+                ]
+            });
+        }
+        
+        function initResponChart() {
+            const chart = echarts.init(document.getElementById('chart-respon'));
+            chart.setOption({
+                tooltip: { trigger: 'item' },
+                series: [{
+                    type: 'pie',
+                    radius: ['45%', '75%'],
+                    center: ['50%', '50%'],
+                    roseType: 'area',
+                    itemStyle: { borderRadius: 6, borderColor: '#1a1a2e', borderWidth: 2 },
+                    data: [
+                        { value: 35, name: '蚀刻工序', itemStyle: { color: '#ff6b6b' } },
+                        { value: 25, name: '钻孔工序', itemStyle: { color: '#ff9f43' } },
+                        { value: 18, name: '压合工序', itemStyle: { color: '#00d4ff' } },
+                        { value: 12, name: '图电工序', itemStyle: { color: '#00ff88' } },
+                        { value: 10, name: '其他工序', itemStyle: { color: '#888' } }
+                    ]
+                }]
+            });
+        }
+        
+        function initScrapTrendChart() {
+            const chart = echarts.init(document.getElementById('chart-scrap-trend'));
+            chart.setOption({
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['报废率', '目标'], textStyle: { color: '#888' } },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: {
+                    type: 'category',
+                    data: ['1月', '2月', '3月', '4月(本)'],
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888' }
+                },
+                yAxis: {
+                    type: 'value',
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888', formatter: '{value}%' },
+                    splitLine: { lineStyle: { color: '#222' } }
+                },
+                series: [
+                    {
+                        name: '报废率',
+                        type: 'line',
+                        data: [3.2, 2.8, 2.5, 2.3],
+                        smooth: true,
+                        lineStyle: { color: '#ff6b6b', width: 3 },
+                        areaStyle: { color: 'rgba(255,107,107,0.1)' }
+                    },
+                    {
+                        name: '目标',
+                        type: 'line',
+                        data: [1.5, 1.5, 1.5, 1.5],
+                        lineStyle: { color: '#00ff88', width: 2, type: 'dashed' }
+                    }
+                ]
+            });
+        }
+        
+        function initScrapTypeChart() {
+            const chart = echarts.init(document.getElementById('chart-scrap-type'));
+            chart.setOption({
+                tooltip: { trigger: 'item' },
+                series: [{
+                    type: 'pie',
+                    radius: '65%',
+                    center: ['50%', '50%'],
+                    data: [
+                        { value: 40, name: '品质问题', itemStyle: { color: '#ff6b6b' } },
+                        { value: 30, name: '操作失误', itemStyle: { color: '#ff9f43' } },
+                        { value: 20, name: '设备故障', itemStyle: { color: '#00d4ff' } },
+                        { value: 10, name: '来料异常', itemStyle: { color: '#00ff88' } }
+                    ],
+                    label: { color: '#e0e0e0' },
+                    itemStyle: { borderRadius: 6, borderColor: '#1a1a2e', borderWidth: 2 }
+                }]
+            });
+        }
+        
+        function initGanttChart() {
+            const chart = echarts.init(document.getElementById('chart-gantt'));
+            const categories = ['钻孔', '沉铜', '线路', '蚀刻', '阻焊', '文字', '成型'];
+            chart.setOption({
+                tooltip: { formatter: function(p) { return p.name + ': ' + p.value[1] + '小时'; } },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: { type: 'time', axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888' }, splitLine: { lineStyle: { color: '#222' } } },
+                yAxis: { type: 'category', data: categories, axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888' } },
+                series: [{
+                    type: 'custom',
+                    renderItem: function(params, api) {
+                        const categoryIndex = api.value(0);
+                        const start = api.coord([api.value(1), categoryIndex]);
+                        const end = api.coord([api.value(2), categoryIndex]);
+                        return { type: 'rect', shape: { x: start[0], y: start[1] - 15, width: end[0] - start[0], height: 30, r: 4 }, style: 'fill' };
+                    },
+                    data: [
+                        [0, 1, 3], [1, 3, 6], [2, 6, 9], [3, 9, 12], [4, 12, 16], [5, 16, 18], [6, 18, 21]
+                    ].map((d, i) => ({
+                        value: d,
+                        itemStyle: { color: ['#00d4ff', '#00ff88', '#ff9f43', '#ff6b6b', '#00d4ff', '#00ff88', '#ff9f43'][i] }
+                    }))
+                }]
+            });
+        }
+        
+        function initYieldChart() {
+            const chart = echarts.init(document.getElementById('chart-yield'));
+            chart.setOption({
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['良率'], textStyle: { color: '#888' } },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: {
+                    type: 'category',
+                    data: ['钻孔', '沉铜', '线路', '蚀刻', '图电', '阻焊', '文字', '成型', '终检'],
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888', rotate: 30 }
+                },
+                yAxis: {
+                    type: 'value',
+                    max: 100,
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888', formatter: '{value}%' },
+                    splitLine: { lineStyle: { color: '#222' } }
+                },
+                series: [{
+                    name: '良率',
+                    type: 'bar',
+                    data: [98.5, 99.2, 97.8, 96.5, 97.2, 98.8, 99.5, 97.3, 99.8],
+                    itemStyle: {
+                        color: function(p) { return p.data >= 98 ? '#00ff88' : p.data >= 96 ? '#ff9f43' : '#ff6b6b'; }
+                    },
+                    barWidth: '50%'
+                }]
+            });
+        }
+        
+        function initSPCChart() {
+            const chart = echarts.init(document.getElementById('chart-spc'));
+            const data = [18.2, 18.5, 18.3, 18.8, 18.6, 19.0, 18.7, 18.4, 18.9, 18.6, 19.1, 18.8, 19.0, 18.5];
+            chart.setOption({
+                tooltip: { trigger: 'axis' },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: {
+                    type: 'category',
+                    data: Array.from({length: 14}, (_, i) => '04-' + String(i+1).padStart(2, '0')),
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888' }
+                },
+                yAxis: {
+                    type: 'value',
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888' },
+                    splitLine: { lineStyle: { color: '#222' } }
+                },
+                series: [
+                    { name: '参数值', type: 'line', data: data, smooth: true, lineStyle: { color: '#00d4ff', width: 2 }, markLine: { data: [{ yAxis: 19, lineStyle: { color: '#ff6b6b', type: 'dashed' }, label: { formatter: 'UCL', color: '#ff6b6b' } }, { yAxis: 18, lineStyle: { color: '#ff6b6b', type: 'dashed' }, label: { formatter: 'LCL', color: '#ff6b6b' } }, { yAxis: 18.5, lineStyle: { color: '#00ff88', type: 'dashed' }, label: { formatter: 'CL', color: '#00ff88' } }] } }
+                ]
+            });
+        }
+        
+        function initEquipChart() {
+            const chart = echarts.init(document.getElementById('chart-equip'));
+            chart.setOption({
+                tooltip: { trigger: 'item' },
+                series: [{
+                    type: 'pie',
+                    radius: '60%',
+                    center: ['50%', '50%'],
+                    data: [
+                        { value: 70, name: '运行中', itemStyle: { color: '#00ff88' } },
+                        { value: 15, name: '待机', itemStyle: { color: '#ff9f43' } },
+                        { value: 10, name: '维护中', itemStyle: { color: '#00d4ff' } },
+                        { value: 5, name: '故障', itemStyle: { color: '#ff6b6b' } }
+                    ],
+                    label: { color: '#e0e0e0' },
+                    itemStyle: { borderRadius: 6, borderColor: '#1a1a2e', borderWidth: 2 }
+                }]
+            });
+        }
+        
+        function initSupplierChart() {
+            const chart = echarts.init(document.getElementById('chart-supplier'));
+            chart.setOption({
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['来料合格率', '交期准时率'], textStyle: { color: '#888' } },
+                grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+                xAxis: {
+                    type: 'category',
+                    data: ['xxx铜业', 'xxx化工', 'xxx化学', 'xxx覆铜', 'xxx板材'],
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888', rotate: 20 }
+                },
+                yAxis: {
+                    type: 'value',
+                    max: 100,
+                    axisLine: { lineStyle: { color: '#333' } },
+                    axisLabel: { color: '#888', formatter: '{value}%' },
+                    splitLine: { lineStyle: { color: '#222' } }
+                },
+                series: [
+                    { name: '来料合格率', type: 'bar', data: [99.5, 98.8, 99.2, 99.0, 98.5], itemStyle: { color: '#00d4ff' }, barWidth: '30%' },
+                    { name: '交期准时率', type: 'bar', data: [98.0, 99.0, 97.5, 98.5, 99.2], itemStyle: { color: '#00ff88' }, barWidth: '30%' }
+                ]
+            });
+        }
+        
+        function initMaterialChart() {
+            const chart = echarts.init(document.getElementById('chart-material'));
+            chart.setOption({
+                tooltip: { trigger: 'item' },
+                series: [{
+                    type: 'pie',
+                    radius: ['40%', '70%'],
+                    center: ['50%', '50%'],
+                    roseType: 'radius',
+                    data: [
+                        { value: 35, name: '铜箔', itemStyle: { color: '#00d4ff' } },
+                        { value: 25, name: '基板', itemStyle: { color: '#00ff88' } },
+                        { value: 20, name: '干膜', itemStyle: { color: '#ff9f43' } },
+                        { value: 12, name: '绿油', itemStyle: { color: '#ff6b6b' } },
+                        { value: 8, name: '药水', itemStyle: { color: '#888' } }
+                    ],
+                    label: { color: '#e0e0e0' },
+                    itemStyle: { borderRadius: 6, borderColor: '#1a1a2e', borderWidth: 2 }
+                }]
+            });
+        }
+        
+        // 响应窗口大小变化
+        window.addEventListener('resize', function() {
+            document.querySelectorAll('[id^="chart-"]').forEach(id => {
+                const chart = echarts.getInstanceByDom(document.getElementById(id));
+                if (chart) chart.resize();
+            });
+        });
+    </script>
+</body>
+</html>

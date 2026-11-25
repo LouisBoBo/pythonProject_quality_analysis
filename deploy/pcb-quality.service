@@ -1,0 +1,31 @@
+[Unit]
+Description=PCB Quality Analysis API (v2)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pcbqa
+Group=pcbqa
+WorkingDirectory=/opt/pcb-quality
+Environment=PYTHONUNBUFFERED=1
+# 重启时端口短暂仍被旧进程占用，允许预检通过（不会改用别人的端口）
+Environment=QA_ALLOW_PORT_REUSE=1
+EnvironmentFile=-/opt/pcb-quality/.env
+ExecStartPre=/opt/pcb-quality/.venv/bin/python /opt/pcb-quality/deploy/preflight_check.py
+ExecStart=/opt/pcb-quality/.venv/bin/python -m app.pcb_quality_api
+Restart=on-failure
+RestartSec=5
+# 日志走 journald；应用也写 logs/
+StandardOutput=journal
+StandardError=journal
+# 安全加固（按需放开读写路径）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/pcb-quality/data /opt/pcb-quality/logs /opt/pcb-quality/output /opt/pcb-quality/.env /www/wwwroot/zr-aicoding/backend
+# 若生产库在其它目录，把路径追加到上一行 ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target
