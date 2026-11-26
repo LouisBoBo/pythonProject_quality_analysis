@@ -38,6 +38,15 @@ _DEFAULT_BRIDGE_DB = Path(
     or "/Users/hebo/Desktop/中软项目/pythonProject_zr_aicoding/backend/erp.db"
 )
 
+# ─── 8D 智能生成入口（与 QA_ENV 一一对应，禁止混用）───
+# 测试：本机 8D 服务（pythonProject_8D_report 开发端口，常见 8001）
+# 生产：公网 Nginx 入口 http://175.178.238.31:18880（禁止误指本机 8001）
+_DEFAULT_TEST_8D_API = "http://127.0.0.1:8001"
+_DEFAULT_PROD_8D_API = "http://175.178.238.31:18880"
+# ERP/MES 登录（zr_aicoding POST /api/auth/login）；同机默认回环 8009
+_DEFAULT_TEST_ERP_AUTH = "http://127.0.0.1:8009"
+_DEFAULT_PROD_ERP_AUTH = "http://127.0.0.1:8009"
+
 # ─── 测试环境：现有 MES/ERP 测试数据 + 现有知识库 ───
 TEST_ENV: Dict[str, Any] = {
     "label": "测试环境",
@@ -49,6 +58,22 @@ TEST_ENV: Dict[str, Any] = {
     ),
     "kb_path": str(Path(os.environ.get("QA_TEST_KB", str(_KB_V2)))),
     "graphrag_url": os.environ.get("QA_TEST_GRAPHRAG_URL", "").strip(),
+    # 仅读 QA_TEST_*；兼容旧变量 QA_8D_API_BASE 作为测试覆盖
+    "eight_d_api_base": (
+        os.environ.get("QA_TEST_8D_API_BASE")
+        or os.environ.get("QA_8D_API_BASE")
+        or _DEFAULT_TEST_8D_API
+    ).strip().rstrip("/"),
+    "eight_d_api_key": (
+        os.environ.get("QA_TEST_8D_API_KEY")
+        or os.environ.get("QA_8D_API_KEY")
+        or ""
+    ).strip(),
+    "erp_auth_base": (
+        os.environ.get("QA_TEST_ERP_AUTH_BASE")
+        or os.environ.get("QA_ERP_AUTH_BASE")
+        or _DEFAULT_TEST_ERP_AUTH
+    ).strip().rstrip("/"),
 }
 
 # ─── 生产环境：请填写生产 MES/ERP 库路径 ───────────
@@ -63,6 +88,19 @@ PROD_ENV: Dict[str, Any] = {
         "QA_PROD_GRAPHRAG_URL",
         os.environ.get("QA_GRAPHRAG_URL", ""),
     ).strip(),
+    # 生产只用 QA_PROD_8D_API_BASE，不继承测试的 QA_8D_API_BASE（防指到本机 8001）
+    "eight_d_api_base": (
+        os.environ.get("QA_PROD_8D_API_BASE") or _DEFAULT_PROD_8D_API
+    ).strip().rstrip("/"),
+    "eight_d_api_key": (
+        os.environ.get("QA_PROD_8D_API_KEY")
+        or os.environ.get("QA_8D_API_KEY")
+        or ""
+    ).strip(),
+    # 生产同机部署走回环；若 MES 在远端再设 QA_PROD_ERP_AUTH_BASE
+    "erp_auth_base": (
+        os.environ.get("QA_PROD_ERP_AUTH_BASE") or _DEFAULT_PROD_ERP_AUTH
+    ).strip().rstrip("/"),
 }
 
 ENV_PROFILES = {
@@ -139,6 +177,24 @@ def resolve_active_paths(env: Optional[str] = None) -> Dict[str, Any]:
             warnings.append(f"生产 ERP 库文件不存在: {erp_path}")
         if not mes_path.exists():
             warnings.append(f"生产 MES 库文件不存在: {mes_path}")
+    eight_d_base = (cfg.get("eight_d_api_base") or "").strip().rstrip("/")
+    if key == "prod":
+        # 生产误配到本机开发口时告警，仍保留配置值便于排查
+        if "127.0.0.1" in eight_d_base or "localhost" in eight_d_base or eight_d_base.endswith(":8001"):
+            warnings.append(
+                f"生产 8D 入口疑似指向本机开发地址（{eight_d_base}）；"
+                f"请设 QA_PROD_8D_API_BASE={_DEFAULT_PROD_8D_API}"
+            )
+        if not (os.environ.get("QA_PROD_8D_API_BASE") or "").strip():
+            # 使用默认公网入口，写进 resolved 便于核对
+            pass
+    elif key == "test":
+        if "18880" in eight_d_base or "175.178.238.31" in eight_d_base:
+            warnings.append(
+                f"测试 8D 入口指向生产公网（{eight_d_base}）；"
+                f"本地调试请用 QA_TEST_8D_API_BASE={_DEFAULT_TEST_8D_API}"
+            )
+
     return {
         "env": key,
         "label": cfg.get("label") or key,
@@ -146,8 +202,30 @@ def resolve_active_paths(env: Optional[str] = None) -> Dict[str, Any]:
         "mes": mes_path,
         "kb": kb_path,
         "graphrag_url": (cfg.get("graphrag_url") or "").strip(),
+        "eight_d_api_base": eight_d_base,
+        "eight_d_api_key": (cfg.get("eight_d_api_key") or "").strip(),
+        "erp_auth_base": (cfg.get("erp_auth_base") or "").strip().rstrip("/"),
         "config": cfg,
         "warnings": warnings,
         "using_bridge_fallback": bool(using_bridge),
         "bridge_db": str(bridge),
+    }
+
+
+def resolve_eight_d_api(env: Optional[str] = None) -> Dict[str, str]:
+    """按当前 QA_ENV 解析 8D 服务 base/key（测试/生产严格隔离）。"""
+    paths = resolve_active_paths(env)
+    return {
+        "env": paths["env"],
+        "base": (paths.get("eight_d_api_base") or "").rstrip("/"),
+        "api_key": (paths.get("eight_d_api_key") or "").strip(),
+    }
+
+
+def resolve_erp_auth(env: Optional[str] = None) -> Dict[str, str]:
+    """按当前 QA_ENV 解析 ERP/MES 登录基址。"""
+    paths = resolve_active_paths(env)
+    return {
+        "env": paths["env"],
+        "base": (paths.get("erp_auth_base") or "").rstrip("/"),
     }

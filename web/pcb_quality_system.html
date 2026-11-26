@@ -6,7 +6,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<meta name="version" content="2026-11-24-chart-fx">
+<meta name="version" content="2026-11-26-8d-evidence-kb">
 <title>PCB智能品质分析系统 v2.0</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
@@ -403,6 +403,10 @@ input[type=date] { cursor:pointer; }
     <div class="status-dot" id="mesDot"><div class="dot"></div><span>MES</span></div>
     <div style="color:var(--text2);font-size:12px;margin-left:8px;" id="topAlertInfo"></div>
     <div style="color:var(--yellow);font-size:11px;margin-left:8px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="topEnvWarn" title=""></div>
+    <div id="topUserBox" style="display:flex;align-items:center;gap:8px;margin-left:10px;padding-left:10px;border-left:1px solid var(--border);">
+      <span style="font-size:12px;color:var(--text2);" id="topUserName">未登录</span>
+      <button class="btn btn-ghost" style="font-size:12px;" onclick="logoutQA()">退出</button>
+    </div>
     <button class="btn btn-ghost" style="font-size:12px;" onclick="checkHealth()">🔄 检测连接</button>
   </div>
 </div>
@@ -960,7 +964,7 @@ input[type=date] { cursor:pointer; }
       <p style="color:var(--text2);font-size:13px;margin-top:4px;">D2 指标仅 ERP/MES 实据 · D4/D5 仅引用已关闭历史或待现场填写 · 关闭后回写已验证知识</p>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <button class="btn btn-success" onclick="show8DGeneratePanel()">✨ 按实据生成</button>
+      <button class="btn btn-success" onclick="show8DGeneratePanel()">✨ 智能生成</button>
       <button class="btn btn-primary" onclick="new8D()">➕ 手动新建</button>
       <button class="btn btn-ghost" onclick="purgeInvalid8D()">🧹 清理无效稿</button>
     </div>
@@ -969,11 +973,11 @@ input[type=date] { cursor:pointer; }
   <!-- 生成面板 -->
   <div class="card" id="genPanel" style="display:none;border:1px solid var(--green);">
     <div class="card-header" style="background:rgba(63,185,80,.08);">
-      <span class="card-title">✨ 按 ERP/MES 实据生成 8D</span>
+      <span class="card-title">✨ 智能生成 8D（料号 + 问题描述）</span>
       <button class="btn btn-ghost" style="font-size:12px;" onclick="hideGenPanel()">✕ 关闭</button>
     </div>
     <div class="card-body">
-      <div class="form-row">
+      <div class="form-row" style="align-items:flex-end;">
         <div class="form-group">
           <label class="form-label">料号（必填）</label>
           <select id="g8dPartSelect" style="width:320px;min-width:240px;" onchange="onG8dPartChange()">
@@ -982,17 +986,28 @@ input[type=date] { cursor:pointer; }
           <input type="text" id="g8dPartCustom" placeholder="输入其他料号"
                  style="display:none;width:260px;margin-top:6px;">
         </div>
-        <div class="form-group">
-          <label class="form-label">开始日期（可选）</label>
-          <input type="date" id="g8dStart">
+        <div class="form-group" style="flex:1;min-width:280px;">
+          <label class="form-label">问题描述（必填）</label>
+          <input type="text" id="g8dProblem" placeholder="如：铝基板线路缺口，疑似油墨粘度异常导致蚀刻不良"
+                 style="width:100%;min-width:280px;">
         </div>
-        <div class="form-group">
-          <label class="form-label">结束日期（可选）</label>
-          <input type="date" id="g8dEnd">
-        </div>
-        <button class="btn btn-success" onclick="generate8D()">生成</button>
+        <button class="btn btn-success" id="g8dGenBtn" onclick="generate8D()">生成</button>
       </div>
-      <p style="color:var(--text2);font-size:12px;">下拉为当月 TOP 报废料号（ERP）；选「其他料号…」可手动输入。未选日期则按当月 FiscalPeriod 拉取报废/入库/缺陷与 MES 工序；并自动对照 GraphRAG 填充 D4/D5（须现场复核）。无实绩时拒绝生成。</p>
+      <div id="g8dGenStatus" style="display:none;margin-top:12px;padding:12px 14px;border-radius:8px;border:1px solid rgba(88,166,255,.35);background:rgba(88,166,255,.08);">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <div class="spinner" id="g8dGenSpinner" style="width:18px;height:18px;border-width:2px;margin:0;flex-shrink:0;"></div>
+          <div style="flex:1;min-width:200px;">
+            <div style="font-weight:600;color:var(--blue);font-size:13px;" id="g8dGenPhase">准备中…</div>
+            <div style="font-size:12px;color:var(--text2);margin-top:2px;" id="g8dGenDetail">LangGraph 闭环通常需要 1–3 分钟，请勿关闭页面</div>
+          </div>
+          <div style="text-align:right;flex-shrink:0;">
+            <div style="font-size:11px;color:var(--text2);">已用时</div>
+            <div style="font-size:20px;font-weight:700;color:var(--text3);font-variant-numeric:tabular-nums;letter-spacing:.02em;" id="g8dGenTimer">0.0s</div>
+          </div>
+        </div>
+        <div id="g8dGenResult" style="display:none;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);font-size:12px;color:var(--text2);line-height:1.6;"></div>
+      </div>
+      <p style="color:var(--text2);font-size:12px;margin-top:10px;">下拉为当月 TOP 报废料号（ERP）；选「其他料号…」可手动输入。调用对外接口 <code>POST /api/v1/8d/generate</code>（LangGraph 闭环），返回 D1–D8 后写入本系统供编辑/导出；须现场复核定稿。</p>
     </div>
   </div>
 
@@ -1213,22 +1228,43 @@ function toast(msg, type='info') {
   setTimeout(() => el.remove(), 3500);
 }
 
-let _tokenPrompted = false;
-function _askToken() {
-  if (_tokenPrompted) return;
-  _tokenPrompted = true;
-  const t = prompt('需要访问令牌（.env 里的 QA_API_TOKEN）：');
-  if (!t || !t.trim()) return;
-  const u = new URL(location.href);
-  u.searchParams.set('token', t.trim());
-  location.replace(u.toString());
+let _authRedirecting = false;
+function _gotoLogin() {
+  if (_authRedirecting) return;
+  _authRedirecting = true;
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.replace('/login.html?next=' + next);
 }
 async function _readJson(r) {
   if (r.status === 401) {
-    _askToken();
-    return { success: false, error: '需要访问令牌' };
+    _gotoLogin();
+    return { success: false, error: '未登录' };
   }
   return await r.json();
+}
+
+async function loadCurrentUser() {
+  try {
+    const r = await fetch(API + '/api/auth/me', { signal: AbortSignal.timeout(8000) });
+    if (r.status === 401) { _gotoLogin(); return; }
+    const d = await r.json();
+    const el = document.getElementById('topUserName');
+    if (d && d.success && d.user) {
+      const u = d.user;
+      const name = u.username || '用户';
+      const ent = u.enterprise_code ? ' · ' + u.enterprise_code : '';
+      if (el) el.textContent = name + ent;
+    } else if (el) {
+      el.textContent = '访客';
+    }
+  } catch (e) {}
+}
+
+async function logoutQA() {
+  try {
+    await fetch(API + '/api/auth/logout', { method: 'POST', signal: AbortSignal.timeout(8000) });
+  } catch (e) {}
+  location.replace('/login.html');
 }
 
 async function api(url) {
@@ -1240,13 +1276,14 @@ async function api(url) {
   }
 }
 
-async function apiPost(url, body) {
+async function apiPost(url, body, opts) {
   try {
+    const timeoutMs = (opts && opts.timeoutMs) || 15000;
     const r = await fetch(API + url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     return await _readJson(r);
   } catch(e) {
@@ -3573,7 +3610,7 @@ async function load8DList() {
   const r = await api(url);
   const el = document.getElementById('list8D');
   if (!r.success || !(r.reports||[]).length) {
-    el.innerHTML = '<div class="empty"><div class="empty-icon">📋</div>暂无有效 8D。请用真实料号「按实据生成」；无 ERP/MES 数据时不会编造报告</div>';
+    el.innerHTML = '<div class="empty"><div class="empty-icon">📋</div>暂无有效 8D。请用「智能生成」填写料号与问题描述</div>';
     return;
   }
   let html = '<div class="table-wrap"><table><thead><tr><th>报告编号</th><th>料号</th><th>问题描述</th><th>严重度</th><th>依据</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
@@ -3632,15 +3669,167 @@ async function export8D(id) {
   }
 }
 
-function show8DGeneratePanel() {
+let _g8dGenTimer = null;
+let _g8dGenPhaseTimer = null;
+let _g8dGenBusy = false;
+let _g8dGenStartedAt = 0;
+
+const G8D_PHASES = [
+  { t: 0,  title: '提交请求…', detail: '正在调用对外 8D 接口' },
+  { t: 3,  title: '拉取 MES 实据…', detail: '按料号聚合报废 / 检验 / 工序数据' },
+  { t: 12, title: '构建 D4 分析上下文…', detail: '缺陷对齐与根因 brief' },
+  { t: 25, title: '智能体生成 D4–D8…', detail: 'Writer 撰写报告草稿' },
+  { t: 50, title: '评估与修订循环…', detail: 'Evaluate / Revise，可能多轮' },
+  { t: 90, title: '定稿汇总中…', detail: '仍在处理，请继续等待' },
+  { t: 150, title: '即将完成…', detail: '耗时较长属正常，请勿刷新页面' },
+];
+
+function _fmtElapsed(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  if (s < 60) return s.toFixed(1) + 's';
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return m + 'm ' + r.toFixed(1) + 's';
+}
+
+function _setG8dGenControls(busy) {
+  _g8dGenBusy = !!busy;
+  const btn = document.getElementById('g8dGenBtn');
+  const sel = document.getElementById('g8dPartSelect');
+  const custom = document.getElementById('g8dPartCustom');
+  const problem = document.getElementById('g8dProblem');
+  if (btn) {
+    btn.disabled = !!busy;
+    btn.textContent = busy ? '生成中…' : '生成';
+  }
+  if (sel) sel.disabled = !!busy;
+  if (custom) custom.disabled = !!busy;
+  if (problem) problem.disabled = !!busy;
+}
+
+function _stopG8dGenTimers() {
+  if (_g8dGenTimer) { clearInterval(_g8dGenTimer); _g8dGenTimer = null; }
+  if (_g8dGenPhaseTimer) { clearInterval(_g8dGenPhaseTimer); _g8dGenPhaseTimer = null; }
+}
+
+function _updateG8dGenPhase(elapsedSec) {
+  const phaseEl = document.getElementById('g8dGenPhase');
+  const detailEl = document.getElementById('g8dGenDetail');
+  if (!phaseEl) return;
+  let cur = G8D_PHASES[0];
+  for (const p of G8D_PHASES) {
+    if (elapsedSec >= p.t) cur = p;
+  }
+  phaseEl.textContent = cur.title;
+  if (detailEl) detailEl.textContent = cur.detail;
+}
+
+function _startG8dGenStatus() {
+  const box = document.getElementById('g8dGenStatus');
+  const timerEl = document.getElementById('g8dGenTimer');
+  const spinner = document.getElementById('g8dGenSpinner');
+  const resultEl = document.getElementById('g8dGenResult');
+  if (!box) return;
+  _stopG8dGenTimers();
+  _g8dGenStartedAt = performance.now();
+  box.style.display = 'block';
+  box.style.borderColor = 'rgba(88,166,255,.35)';
+  box.style.background = 'rgba(88,166,255,.08)';
+  if (spinner) spinner.style.display = 'block';
+  if (resultEl) { resultEl.style.display = 'none'; resultEl.innerHTML = ''; }
+  if (timerEl) timerEl.textContent = '0.0s';
+  _updateG8dGenPhase(0);
+  _g8dGenTimer = setInterval(() => {
+    const sec = (performance.now() - _g8dGenStartedAt) / 1000;
+    if (timerEl) timerEl.textContent = _fmtElapsed(sec);
+    _updateG8dGenPhase(sec);
+  }, 200);
+}
+
+function _finishG8dGenStatus(ok, meta) {
+  _stopG8dGenTimers();
+  const box = document.getElementById('g8dGenStatus');
+  const timerEl = document.getElementById('g8dGenTimer');
+  const spinner = document.getElementById('g8dGenSpinner');
+  const phaseEl = document.getElementById('g8dGenPhase');
+  const detailEl = document.getElementById('g8dGenDetail');
+  const resultEl = document.getElementById('g8dGenResult');
+  const clientSec = (performance.now() - (_g8dGenStartedAt || performance.now())) / 1000;
+  if (timerEl) timerEl.textContent = _fmtElapsed(clientSec);
+  if (spinner) spinner.style.display = 'none';
+  if (!box) return;
+  if (ok) {
+    box.style.borderColor = 'rgba(63,185,80,.4)';
+    box.style.background = 'rgba(63,185,80,.08)';
+    if (phaseEl) phaseEl.textContent = '生成完成';
+    if (detailEl) detailEl.textContent = meta.message || '已写入本系统，可继续编辑';
+  } else {
+    box.style.borderColor = 'rgba(248,81,73,.4)';
+    box.style.background = 'rgba(248,81,73,.08)';
+    if (phaseEl) phaseEl.textContent = '生成失败';
+    if (detailEl) detailEl.textContent = meta.message || '请检查料号/问题描述或 8D 服务状态后重试';
+  }
+  if (resultEl) {
+    const bits = [];
+    bits.push(`前端耗时 <b>${_esc(_fmtElapsed(clientSec))}</b>`);
+    if (meta.elapsed_s != null && meta.elapsed_s !== '') {
+      bits.push(`服务端 <b>${_esc(_fmtElapsed(meta.elapsed_s))}</b>`);
+    }
+    if (meta.qualified) bits.push(`结果 <b>${_esc(meta.qualified)}</b>`);
+    if (meta.total_score != null && meta.total_score !== '') {
+      bits.push(`得分 <b>${_esc(meta.total_score)}</b>`);
+    }
+    if (meta.thread_id) bits.push(`thread <code>${_esc(meta.thread_id)}</code>`);
+    const logs = Array.isArray(meta.round_logs) ? meta.round_logs : [];
+    if (logs.length) {
+      const last = logs.slice(-3).map(x => {
+        const step = x.step || x.name || 'step';
+        const st = x.ok === false ? '失败' : '完成';
+        const es = x.elapsed_s != null ? ` ${_fmtElapsed(x.elapsed_s)}` : '';
+        return `${step} ${st}${es}`;
+      }).join(' · ');
+      bits.push(`最近步骤：${_esc(last)}`);
+    }
+    resultEl.innerHTML = bits.join(' · ');
+    resultEl.style.display = 'block';
+  }
+}
+
+function show8DGeneratePanel(opts) {
   document.getElementById('genPanel').style.display = 'block';
-  document.getElementById('g8dStart').value = '';
-  document.getElementById('g8dEnd').value = '';
   const custom = document.getElementById('g8dPartCustom');
   if (custom) { custom.style.display = 'none'; custom.value = ''; }
-  load8DPartOptions();
+  const problemEl = document.getElementById('g8dProblem');
+  if (problemEl && !(opts && opts.keepProblem)) problemEl.value = (opts && opts.problem_desc) || '';
+  if (!_g8dGenBusy) {
+    const box = document.getElementById('g8dGenStatus');
+    if (box) box.style.display = 'none';
+    _stopG8dGenTimers();
+  }
+  load8DPartOptions().then(() => {
+    if (opts && opts.part) {
+      const sel = document.getElementById('g8dPartSelect');
+      if (!sel) return;
+      const part = String(opts.part).trim();
+      if ([...sel.options].some(o => o.value === part)) {
+        sel.value = part;
+        onG8dPartChange();
+      } else {
+        sel.value = '__custom__';
+        onG8dPartChange();
+        if (custom) { custom.value = part; custom.style.display = 'block'; }
+      }
+    }
+  });
 }
-function hideGenPanel() { document.getElementById('genPanel').style.display = 'none'; }
+function hideGenPanel() {
+  if (_g8dGenBusy) {
+    toast('8D 正在生成中，请等待完成（可继续查看用时）', 'info');
+    return;
+  }
+  document.getElementById('genPanel').style.display = 'none';
+  _stopG8dGenTimers();
+}
 
 function onG8dPartChange() {
   const sel = document.getElementById('g8dPartSelect');
@@ -3698,25 +3887,55 @@ async function load8DPartOptions() {
 }
 
 async function generate8D() {
+  if (_g8dGenBusy) { toast('正在生成中，请稍候', 'info'); return; }
   const part = getG8dPartValue();
   if (!part) { toast('请选择或输入料号', 'err'); return; }
   if (part === '__custom__') { toast('请输入其他料号', 'err'); return; }
-  const start = document.getElementById('g8dStart').value;
-  const end = document.getElementById('g8dEnd').value;
-  toast('正在拉取 ERP/MES 实据，并对照知识库生成 8D…', 'info');
-  let body = { part };
-  if (start) body.start = start;
-  if (end) body.end = end;
-  if (!start && !end) {
-    const d = new Date();
-    body.fiscal_period = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const problem = (document.getElementById('g8dProblem') || {}).value || '';
+  if (!problem.trim()) { toast('请填写问题描述', 'err'); return; }
+
+  _setG8dGenControls(true);
+  _startG8dGenStatus();
+  toast('已开始生成，请关注下方状态与用时', 'info');
+
+  const body = { part_no: part, problem_desc: problem.trim() };
+  let r;
+  try {
+    r = await apiPost('/api/8d/generate', body, { timeoutMs: 200000 });
+  } catch (e) {
+    r = { success: false, error: (e && e.message) || String(e) };
   }
-  const r = await apiPost('/api/8d/generate', body);
-  if (!r.success) { toast('生成失败: ' + (r.error||''), 'err'); return; }
-  toast(r.message || '8D已生成', 'ok');
-  hideGenPanel();
+
+  if (!r || !r.success) {
+    _finishG8dGenStatus(false, { message: (r && r.error) || '生成失败' });
+    _setG8dGenControls(false);
+    toast('生成失败: ' + ((r && r.error) || ''), 'err');
+    return;
+  }
+
+  _finishG8dGenStatus(true, {
+    message: r.message || '8D已生成',
+    elapsed_s: r.elapsed_s,
+    qualified: r.qualified,
+    total_score: r.total_score,
+    thread_id: r.thread_id,
+    round_logs: r.round_logs,
+  });
+  _setG8dGenControls(false);
+
+  const scoreHint = (r.qualified || r.total_score)
+    ? `（${r.qualified || ''}${r.total_score != null ? ' · ' + r.total_score + '分' : ''}）`
+    : '';
+  const timeHint = r.elapsed_s != null ? ` · 服务端 ${_fmtElapsed(r.elapsed_s)}` : '';
+  toast((r.message || '8D已生成') + scoreHint + timeHint, r.ok === false ? 'info' : 'ok');
   load8DList();
-  if (r.report?.id) open8D(r.report.id);
+  if (r.report?.id) {
+    // 稍留结果条给用户看一眼用时，再打开编辑器
+    setTimeout(() => {
+      hideGenPanel();
+      open8D(r.report.id);
+    }, 800);
+  }
 }
 
 function new8D() {
@@ -3753,13 +3972,87 @@ function _parse8DKnowledge(rp) {
   return kb;
 }
 
-function render8DEvidence(rp) {
-  const el = document.getElementById('e8dEvidence');
-  if (!el) return;
+function _parse8DEvidence(rp) {
   let ev = rp.evidence;
   if (!ev && rp.evidence_json) {
     try { ev = JSON.parse(rp.evidence_json); } catch (e) { ev = null; }
   }
+  return ev && typeof ev === 'object' ? ev : null;
+}
+
+function _isExternal8D(rp) {
+  const policy = String(rp.data_policy || '');
+  const ev = _parse8DEvidence(rp) || {};
+  return policy.includes('external=langgraph') || ev.kind === 'external_langgraph' || ev.source === 'external_8d_api';
+}
+
+/** 旧稿实据为空时，从 D2/问题描述回填展示用快照（不落库） */
+function _enrichEvidenceFromReport(rp, ev) {
+  ev = Object.assign({}, ev || {});
+  if (!ev.part_no) ev.part_no = rp.part_number || '';
+  if (!ev.problem_desc) ev.problem_desc = rp.problem || '';
+  const d2 = String(rp.d2 || '');
+  const pick = (label) => {
+    const m = d2.match(new RegExp('【' + label + '】\\s*([^\\n【]+)'));
+    return m ? m[1].trim() : '';
+  };
+  if (!ev.product) ev.product = pick('产品');
+  if (!ev.phenomenon) ev.phenomenon = pick('现象') || (rp.problem || '');
+  if (!ev.discovery_process) ev.discovery_process = pick('发现工序');
+  if (!ev.affected_qty) ev.affected_qty = pick('影响数量');
+  if (!ev.data_sources) ev.data_sources = rp.data_policy || '';
+  if (!(ev.defects || []).length && (ev.phenomenon || rp.problem)) {
+    ev.defects = [{
+      defect_type: ev.phenomenon || rp.problem,
+      process_name: ev.discovery_process || '',
+      scrap_pcs: null,
+    }];
+  }
+  return ev;
+}
+
+/** 智能生成稿若无 knowledge_refs，从 D4/D5 抽出根因/对策供展示 */
+function _knowledgeFromD4D5(rp) {
+  const d4 = String(rp.d4 || '');
+  const d5 = String(rp.d5 || '');
+  const causes = [];
+  d4.split(/\n+/).forEach(line => {
+    const t = line.trim();
+    if (!t) return;
+    if (/^→/.test(t) || /根因|原因|why/i.test(t)) {
+      causes.push({ cause: t.replace(/^→\s*/, ''), category: '' });
+    }
+  });
+  if (!causes.length && d4.trim()) {
+    causes.push({ cause: d4.trim().slice(0, 500), category: 'D4摘要' });
+  }
+  const measures = [];
+  d5.split(/\n+/).forEach(line => {
+    const t = line.replace(/^\d+\.\s*/, '').trim();
+    if (t) measures.push({ measure: t, standard: '' });
+  });
+  if (!causes.length && !measures.length) return { refs: [], hit_count: 0, applied: true };
+  return {
+    source: '从 D4/D5 回显（智能生成）',
+    source_url: 'http://175.178.238.31',
+    applied: true,
+    hit_count: 1,
+    refs: [{
+      matched: rp.problem || rp.part_number || '本次生成',
+      match_type: 'from_d4_d5',
+      processes: [],
+      root_causes: causes.slice(0, 12),
+      countermeasures: measures.slice(0, 12),
+      source: '已写入正文，须现场复核',
+      evidence: '',
+    }],
+  };
+}
+
+function render8DEvidence(rp) {
+  const el = document.getElementById('e8dEvidence');
+  if (!el) return;
+  let ev = _parse8DEvidence(rp);
   let refs = rp.history_refs;
   if (!refs && rp.history_refs_json) {
     try { refs = JSON.parse(rp.history_refs_json); } catch (e) { refs = []; }
@@ -3767,47 +4060,103 @@ function render8DEvidence(rp) {
   refs = refs || [];
   const kb = _parse8DKnowledge(rp);
   const kbN = kb.hit_count || (kb.refs || []).length || 0;
+  const external = _isExternal8D(rp);
+
+  if (external || (ev && (ev.kind === 'external_langgraph' || ev.problem_desc || ev.phenomenon))) {
+    ev = _enrichEvidenceFromReport(rp, ev);
+    const defects = (ev.defects || rp.defects || []).slice(0, 5);
+    const defLine = defects.map(d => {
+      const pcs = d.scrap_pcs != null && d.scrap_pcs !== '' ? ` ${fmt(d.scrap_pcs)}PCS` : '';
+      return `${d.defect_type || ''}${pcs}`;
+    }).filter(Boolean).join(' · ') || (ev.phenomenon || '—');
+    const logs = Array.isArray(ev.round_logs) ? ev.round_logs : [];
+    const logLine = logs.length
+      ? logs.slice(-5).map(x => {
+          const step = x.step || x.name || 'step';
+          const st = x.ok === false ? '失败' : '完成';
+          const es = x.elapsed_s != null ? ` ${_fmtElapsed(x.elapsed_s)}` : '';
+          return `${step}${st}${es}`;
+        }).join(' · ')
+      : '';
+    const scoreBits = [
+      ev.qualified ? `评定 <b>${_esc(ev.qualified)}</b>` : '',
+      (ev.total_score != null && ev.total_score !== '') ? `得分 <b>${_esc(ev.total_score)}</b>` : '',
+      (ev.elapsed_s != null && ev.elapsed_s !== '') ? `耗时 <b>${_esc(_fmtElapsed(ev.elapsed_s))}</b>` : '',
+    ].filter(Boolean).join(' · ');
+    el.innerHTML = `
+      <div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:rgba(88,166,255,.06);font-size:12px;line-height:1.7;">
+        <div style="font-weight:600;color:var(--blue);margin-bottom:6px;">实据快照（智能生成 · MES/图谱闭环）</div>
+        <div>料号 <b>${_esc(ev.part_no || rp.part_number || '—')}</b>
+          ${ev.customer ? ` · 客户 ${_esc(ev.customer)}` : ''}
+          ${ev.product ? ` · 产品 ${_esc(ev.product)}` : ''}</div>
+        <div>问题描述：${_esc(ev.problem_desc || rp.problem || '—')}</div>
+        <div>不良现象：${_esc(ev.phenomenon || '—')}
+          ${ev.discovery_process ? ` · 发现工序 <b>${_esc(ev.discovery_process)}</b>` : ''}
+          ${ev.affected_qty ? ` · 影响数量 ${_esc(ev.affected_qty)}` : ''}</div>
+        <div>TOP/主不良：${_esc(defLine)}</div>
+        ${(ev.d3_items && ev.d3_items.length)
+          ? `<div>临时措施：${_esc((ev.d3_title ? '【' + ev.d3_title + '】' : '') + ev.d3_items.slice(0, 3).join('；'))}</div>`
+          : ''}
+        <div>数据源：${_esc(ev.data_sources || 'MES + FMEA GraphRAG + LangGraph')}</div>
+        ${scoreBits ? `<div style="margin-top:4px;">${scoreBits}</div>` : ''}
+        ${ev.thread_id ? `<div>thread <code>${_esc(ev.thread_id)}</code></div>` : ''}
+        ${logLine ? `<div style="margin-top:2px;color:var(--text2);">步骤：${_esc(logLine)}</div>` : ''}
+        <div style="margin-top:4px;color:var(--text2);">说明：指标与根因来自 8D 服务闭环结果，须现场复核后定稿。</div>
+      </div>`;
+    return;
+  }
+
   if (!ev && !refs.length && !kbN) {
     el.innerHTML = `<div style="padding:10px 12px;border:1px dashed var(--border);border-radius:8px;font-size:12px;color:var(--text2);">
-      无实据快照（旧稿或手动新建）。建议用「按实据生成」，或在下方检索知识库写入 D4/D5。
+      无实据快照（旧稿或手动新建）。建议用「智能生成」自动带入问题/工序与根因对策。
     </div>`;
     return;
   }
   const defects = (ev && ev.defects) || rp.defects || [];
   const defLine = defects.slice(0, 5).map(d =>
-    `${d.defect_type || ''} ${d.scrap_pcs || 0}PCS`).join(' · ') || '—';
+    `${d.defect_type || ''} ${d.scrap_pcs != null ? d.scrap_pcs + 'PCS' : ''}`.trim()).join(' · ') || '—';
   const refLine = refs.length
     ? refs.map(h => h.report_no || h.id).join('、')
     : '无';
   const kbLine = kbN
     ? (kb.refs || []).map(x => x.matched || x.query).filter(Boolean).join('、')
     : '无';
+  const periodTxt = (ev && (ev.fiscal_period || ev.date_range)) || '—';
+  const srcTxt = (ev && ev.data_sources) || rp.data_policy || '—';
   el.innerHTML = `
     <div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:rgba(88,166,255,.06);font-size:12px;line-height:1.6;">
       <div style="font-weight:600;color:var(--blue);margin-bottom:6px;">实据 · 历史 · 知识库（有据可依，禁止编造）</div>
-      <div>周期：${(ev && (ev.fiscal_period || ev.date_range)) || '—'} · 报废率 <b>${ev ? (ev.scrap_rate ?? '—') : '—'}%</b>
-        （报废 ${ev ? fmt(ev.scrap_pcs) : '—'} / 入库 ${ev ? fmt(ev.stock_pcs) : '—'} PCS）</div>
-      <div>TOP 不良：${defLine}</div>
-      <div>MES 检验笔数：${ev ? fmt(ev.mes_inspect_count) : '—'} · 均良率 ${ev && ev.mes_avg_yield != null ? ev.mes_avg_yield + '%' : '—'}</div>
-      <div>数据源：${(ev && ev.data_sources) || rp.data_policy || '—'}</div>
-      <div style="margin-top:4px;">历史关闭方案：${refLine}</div>
-      <div>知识库命中：${kbLine}${kbN ? `（${kbN} 条 GraphRAG）` : ''}</div>
+      <div>周期：${_esc(periodTxt)} · 报废率 <b>${_esc(ev ? (ev.scrap_rate ?? '—') : '—')}%</b>
+        （报废 ${_esc(ev ? fmt(ev.scrap_pcs) : '—')} / 入库 ${_esc(ev ? fmt(ev.stock_pcs) : '—')} PCS）</div>
+      <div>TOP 不良：${_esc(defLine)}</div>
+      <div>MES 检验笔数：${_esc(ev ? fmt(ev.mes_inspect_count) : '—')} · 均良率 ${_esc(ev && ev.mes_avg_yield != null ? ev.mes_avg_yield + '%' : '—')}</div>
+      <div>数据源：${_esc(srcTxt)}</div>
+      <div style="margin-top:4px;">历史关闭方案：${_esc(refLine)}</div>
+      <div>知识库命中：${_esc(kbLine)}${kbN ? `（${kbN} 条 GraphRAG）` : ''}</div>
     </div>`;
 }
 
 function render8DKnowledge(rp) {
   const el = document.getElementById('e8dKnowledge');
   if (!el) return;
-  const kb = _parse8DKnowledge(rp);
-  const refs = kb.refs || [];
+  let kb = _parse8DKnowledge(rp);
+  let refs = kb.refs || [];
+  const external = _isExternal8D(rp);
+  // 智能生成：优先展示已写入的根因/对策；旧空稿从 D4/D5 回显
+  if (external && (!refs.length || !(kb.hit_count || refs.length))) {
+    kb = _knowledgeFromD4D5(rp);
+    refs = kb.refs || [];
+  }
   const defects = rp.defects || [];
   let seedDefect = '';
   if (defects.length && defects[0].defect_type) seedDefect = defects[0].defect_type;
+  else if (rp.problem) seedDefect = String(rp.problem).slice(0, 40);
   const srcUrl = kb.source_url || 'http://175.178.238.31';
+  const applied = !!(kb.applied || (refs[0] && /langgraph|from_d4_d5|已写入/.test(String(refs[0].match_type || '') + String(refs[0].source || ''))));
 
   let body = '';
   if (!refs.length) {
-    body = `<div style="color:var(--text2);font-size:12px;margin-top:8px;">尚未命中知识库。输入不良类型后点击检索，可将根因/对策写入 D4/D5。</div>`;
+    body = `<div style="color:var(--text2);font-size:12px;margin-top:8px;">暂无根因/对策摘要。可在下方补充检索 GraphRAG，或直接在 D4/D5 编辑。</div>`;
   } else {
     body = refs.map((ref, ri) => {
       const causes = ref.root_causes || [];
@@ -3818,48 +4167,60 @@ function render8DKnowledge(rp) {
         <div class="pattern-title">
           <span class="hl">${_esc(title)}</span>
           ${proc ? `<span style="color:var(--text2);font-size:12px;margin-left:8px;">@ ${_esc(proc)}</span>` : ''}
-          <span style="float:right;font-size:11px;color:var(--text2);">${_esc(ref.match_type || 'graph')}</span>
+          <span style="float:right;font-size:11px;color:var(--text2);">${_esc(applied ? '已写入正文' : (ref.match_type || 'graph'))}</span>
         </div>
+        <div style="font-size:12px;color:var(--text2);margin:6px 0 4px;">根因分析</div>
         <div class="pattern-tags">
           ${causes.length
-            ? causes.map((c, ci) =>
-                `<span class="tag tag-red" style="cursor:pointer;" title="写入 D4"
-                  onclick="applyKbIndexedTo8D(${ri},'d4',${ci})">根因${c.category ? '[' + _esc(c.category) + ']' : ''}: ${_esc(c.cause || '')}</span>`
+            ? causes.map((c) =>
+                `<span class="tag tag-red" title="${_esc(c.why || c.category || '')}">${c.category ? '[' + _esc(c.category) + '] ' : ''}${_esc(c.cause || '')}</span>`
               ).join('')
             : '<span class="tag tag-muted">无根因</span>'}
         </div>
+        <div style="font-size:12px;color:var(--text2);margin:8px 0 4px;">解决对策</div>
         <div class="pattern-tags">
           ${cms.length
-            ? cms.map((m, mi) =>
-                `<span class="tag tag-green" style="cursor:pointer;" title="写入 D5"
-                  onclick="applyKbIndexedTo8D(${ri},'d5',${mi})">对策: ${_esc(m.measure || '')}</span>`
+            ? cms.map((m) =>
+                `<span class="tag tag-green">${_esc(m.measure || '')}${m.standard ? '（' + _esc(m.standard) + '）' : ''}</span>`
               ).join('')
             : '<span class="tag tag-muted">无对策</span>'}
         </div>
-        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="applyKbRefTo8D(${ri}, 'd4')">全部根因 → D4</button>
-          <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="applyKbRefTo8D(${ri}, 'd5')">全部对策 → D5</button>
-        </div>
-        <div class="kb-source">来源：${_esc(ref.source || 'GraphRAG/FMEA')} · ${_esc(ref.evidence || '')}</div>
+        ${applied
+          ? `<div style="margin-top:8px;font-size:11px;color:var(--text2);">以上内容已体现在下方 D4/D5，可直接修订；无需再点「写入」。</div>`
+          : `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="applyKbRefTo8D(${ri}, 'd4')">全部根因 → D4</button>
+              <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="applyKbRefTo8D(${ri}, 'd5')">全部对策 → D5</button>
+            </div>`}
+        <div class="kb-source">来源：${_esc(ref.source || kb.source || 'GraphRAG/FMEA')} · ${_esc(ref.evidence || '')}</div>
       </div>`;
     }).join('');
   }
 
+  const titleText = applied
+    ? '🧠 智能生成 · 根因分析与解决对策'
+    : '🧠 自主学习知识库参考（GraphRAG）';
+  const hint = applied
+    ? '以下为本次闭环已生成的根因/对策摘要（与 D4/D5 同步）。仍须现场复核，不可直接作为已确认结论。'
+    : '点击标签写入单条；写入后仍须现场复核，不得直接当作已确认结论。';
+
   el.innerHTML = `
     <div style="padding:12px;border:1px solid rgba(63,185,80,.35);border-radius:8px;background:rgba(63,185,80,.06);">
       <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
-        <div style="font-weight:600;color:var(--green);">🧠 自主学习知识库参考（GraphRAG）</div>
+        <div style="font-weight:600;color:var(--green);">${titleText}</div>
         <a href="${_esc(srcUrl)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--blue);">打开图谱</a>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center;">
-        <input type="text" id="e8dKbDefect" placeholder="不良类型，如：开料错 / 水洗不净"
-               value="${_esc(seedDefect)}" style="width:220px;">
-        <input type="text" id="e8dKbProcess" placeholder="工序（可选）" style="width:140px;">
-        <button class="btn btn-primary" style="font-size:12px;" onclick="lookup8DKnowledge()">🔍 检索知识库</button>
-        <button class="btn btn-ghost" style="font-size:12px;" onclick="applyAllKbTo8D()">全部写入 D4/D5</button>
-      </div>
-      <div style="font-size:11px;color:var(--text2);margin-top:6px;">点击标签写入单条；写入后仍须现场复核，不得直接当作已确认结论。</div>
       <div id="e8dKbBody">${body}</div>
+      <details style="margin-top:12px;">
+        <summary style="cursor:pointer;font-size:12px;color:var(--text2);user-select:none;">补充检索 GraphRAG（可选）</summary>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center;">
+          <input type="text" id="e8dKbDefect" placeholder="不良类型，如：开料错 / 水洗不净"
+                 value="${_esc(seedDefect)}" style="width:220px;">
+          <input type="text" id="e8dKbProcess" placeholder="工序（可选）" style="width:140px;">
+          <button class="btn btn-primary" style="font-size:12px;" onclick="lookup8DKnowledge()">🔍 检索知识库</button>
+          <button class="btn btn-ghost" style="font-size:12px;" onclick="applyAllKbTo8D()">全部写入 D4/D5</button>
+        </div>
+        <div style="font-size:11px;color:var(--text2);margin-top:6px;">${_esc(hint)}</div>
+      </details>
     </div>`;
   _8dEditData._kbRefs = refs;
 }
@@ -3934,6 +4295,15 @@ async function lookup8DKnowledge() {
 
 function show8DEditor(rp) {
   _8dEditData = rp;
+  if (!rp.defects && rp.defects_json) {
+    try { rp.defects = JSON.parse(rp.defects_json); } catch (e) { rp.defects = []; }
+  }
+  if (!rp.evidence && rp.evidence_json) {
+    try { rp.evidence = JSON.parse(rp.evidence_json); } catch (e) { rp.evidence = null; }
+  }
+  if (!rp.knowledge_refs && rp.knowledge_refs_json) {
+    try { rp.knowledge_refs = JSON.parse(rp.knowledge_refs_json); } catch (e) { rp.knowledge_refs = null; }
+  }
   document.getElementById('edit8DPanel').style.display = 'block';
   document.getElementById('edit8DTitle').textContent = `8D — ${rp.report_no || rp.id}`;
   document.getElementById('e8dId').value = rp.id;
@@ -4185,7 +4555,7 @@ async function loadAlerts() {
                 ? `<span class="badge badge-ok">已确认</span>`
                 : `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="ackAlert('${idSafe}')">✓ 确认</button>`}
               ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="gotoTraceFromAlert('${partSafe}')">🔍 追溯</button>` : ''}
-              ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="create8DFromAlert('${partSafe}')">📋 转8D</button>` : ''}
+              ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="create8DFromAlert('${partSafe}', '${String(a.message || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r?\n/g,' ')}')">📋 转8D</button>` : ''}
             </div>
           </div>
         </div>
@@ -4215,19 +4585,12 @@ function gotoTraceFromAlert(part) {
   runTrace();
 }
 
-async function create8DFromAlert(part) {
+async function create8DFromAlert(part, message) {
   if (!part) return;
-  toast('正在按 ERP/MES 实据为 ' + part + ' 生成 8D…', 'info');
-  const d = new Date();
-  const fp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
-  const r = await apiPost('/api/8d/generate', { part, fiscal_period: fp });
-  if (r.success && r.report?.id) {
-    toast(r.message || '8D 已生成', 'ok');
-    showPage('8d');
-    open8D(r.report.id);
-  } else {
-    toast('生成失败: ' + (r.error || '未知错误'), 'err');
-  }
+  showPage('8d');
+  const hint = (message || '').trim() || (`品质预警转8D · 料号 ${part}`);
+  show8DGeneratePanel({ part, problem_desc: hint });
+  toast('已带入料号与预警信息，请确认问题描述后点「生成」', 'info');
 }
 
 // ════════════════════════════════════════════════
@@ -5111,7 +5474,8 @@ function drawTrendCanvas(canvas, data) {
   setDefaultDates('sStart', 'sEnd');
   setDefaultDates('tStart', 'tEnd');
 
-  // 检查连接（顶栏仅展示工程配置中的当前环境名，不可切换）
+  // 检查登录态与连接（顶栏仅展示工程配置中的当前环境名，不可切换）
+  await loadCurrentUser();
   await checkHealth();
 
   // 加载仪表板

@@ -85,6 +85,38 @@ TARGET_REWORK_RATE = float(os.environ.get("QA_TARGET_REWORK_RATE", "3.0"))
 ALERT_OVERDUE_HOURS = float(os.environ.get("QA_ALERT_OVERDUE_HOURS", "24"))
 EIGHT_D_OVERDUE_DAYS = float(os.environ.get("QA_8D_OVERDUE_DAYS", "7"))
 
+# ─── 对外 8D 智能生成服务（随 QA_ENV=test|prod 解析，禁止混用）──
+# 测试默认 http://127.0.0.1:8001 ；生产默认 http://175.178.238.31:18880
+# 覆盖：QA_TEST_8D_API_BASE / QA_PROD_8D_API_BASE（生产不读 QA_8D_API_BASE）
+from config.env_profiles import resolve_eight_d_api  # noqa: E402
+
+_eight_d = resolve_eight_d_api()
+EIGHT_D_API_BASE = (_eight_d.get("base") or "http://127.0.0.1:8001").rstrip("/")
+EIGHT_D_API_KEY = (_eight_d.get("api_key") or "").strip()
+EIGHT_D_API_TIMEOUT = float(os.environ.get("QA_8D_API_TIMEOUT", "180"))
+EIGHT_D_API_ENV = _eight_d.get("env") or ACTIVE_ENV
+
+# ─── ERP/MES 登录（zr_aicoding /api/auth/login）──
+from config.env_profiles import resolve_erp_auth  # noqa: E402
+
+_erp_auth = resolve_erp_auth()
+ERP_AUTH_BASE = (_erp_auth.get("base") or "http://127.0.0.1:8009").rstrip("/")
+ERP_AUTH_TIMEOUT = float(os.environ.get("QA_ERP_AUTH_TIMEOUT", "15"))
+# 是否强制用户登录（1=需 ERP 账号；0=仅 QA_API_TOKEN / 免登）
+REQUIRE_LOGIN = os.environ.get("QA_REQUIRE_LOGIN", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+SESSION_TTL_SECONDS = int(os.environ.get("QA_SESSION_TTL_SECONDS", str(86400 * 7)))
+# Cookie Secure 标记：1=强制 Secure；auto=检测到 HTTPS / X-Forwarded-Proto=https 时加 Secure
+_COOKIE_SECURE_RAW = (os.environ.get("QA_COOKIE_SECURE") or "auto").strip().lower()
+COOKIE_SECURE_MODE = _COOKIE_SECURE_RAW  # "1"/"true"/"yes" | "0"/"false" | "auto"
+# 登录页可选企业编码（逗号分隔）
+LOGIN_ENTERPRISES = [
+    x.strip()
+    for x in (os.environ.get("QA_LOGIN_ENTERPRISES") or "江西中软电子有限公司").split(",")
+    if x.strip()
+]
+
 # ─── ERP / MES 连接器搜索路径（按优先级）─────────────
 # 可通过环境变量 QA_CONNECTOR_PATHS 追加，使用 os.pathsep 分隔
 _DEFAULT_CONNECTOR_PATHS = [

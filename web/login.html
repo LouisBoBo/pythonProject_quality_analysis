@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>登录 · PCB智能品质分析系统</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #1c2128; --bg4: #21262d;
+  --border: #30363d; --text: #c9d1d9; --text2: #8b949e; --text3: #f0f6fc;
+  --blue: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+  --teal: #39d353; --r: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  min-height: 100vh;
+  overflow: hidden;
+}
+.stage {
+  position: relative;
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  isolation: isolate;
+}
+.stage::before {
+  content: "";
+  position: absolute; inset: 0; z-index: -2;
+  background:
+    radial-gradient(120% 80% at 8% -10%, rgba(88,166,255,.22), transparent 55%),
+    radial-gradient(90% 70% at 100% 100%, rgba(63,185,80,.12), transparent 50%),
+    radial-gradient(60% 50% at 70% 20%, rgba(248,81,73,.06), transparent 45%),
+    linear-gradient(160deg, #0d1117 0%, #111821 45%, #0d1117 100%);
+}
+.aurora {
+  position: absolute; inset: -20% -10%; z-index: -1; pointer-events: none;
+  background:
+    conic-gradient(from 180deg at 40% 40%, rgba(88,166,255,.08), transparent 35%, rgba(63,185,80,.07), transparent 70%);
+  animation: drift 18s linear infinite;
+  filter: blur(40px);
+  opacity: .85;
+}
+@keyframes drift {
+  from { transform: rotate(0deg) scale(1.05); }
+  to { transform: rotate(360deg) scale(1.05); }
+}
+.grid-fx {
+  position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  background-image:
+    linear-gradient(rgba(88,166,255,.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(88,166,255,.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at 30% 40%, #000 20%, transparent 72%);
+  animation: gridPulse 6s ease-in-out infinite;
+}
+@keyframes gridPulse {
+  0%, 100% { opacity: .35; }
+  50% { opacity: .65; }
+}
+
+.brand-pane {
+  position: relative; z-index: 1;
+  padding: 48px 56px 40px;
+  display: flex; flex-direction: column; justify-content: space-between;
+  min-height: 100vh;
+}
+.brand-top { display: flex; align-items: center; gap: 12px; }
+.logo-mark {
+  width: 42px; height: 42px; border-radius: 12px;
+  display: grid; place-items: center;
+  background: linear-gradient(135deg, rgba(88,166,255,.95), rgba(63,185,80,.85));
+  box-shadow: 0 0 0 1px rgba(88,166,255,.35), 0 10px 28px rgba(88,166,255,.25);
+  font-weight: 800; color: #061018; font-size: 18px;
+}
+.logo-text { font-size: 18px; font-weight: 700; color: var(--text3); letter-spacing: .02em; }
+.logo-text small { display: block; font-size: 12px; color: var(--text2); font-weight: 500; margin-top: 2px; }
+
+.hero { max-width: 560px; margin-top: 8vh; }
+.hero-kicker {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-radius: 999px;
+  border: 1px solid rgba(88,166,255,.35);
+  background: rgba(88,166,255,.1);
+  color: var(--blue); font-size: 12px; font-weight: 600;
+  margin-bottom: 18px;
+}
+.hero h1 {
+  font-size: clamp(28px, 4vw, 42px);
+  line-height: 1.15; color: var(--text3); font-weight: 760;
+  letter-spacing: -.02em;
+}
+.hero h1 span {
+  background: linear-gradient(90deg, #58a6ff, #3fb950 70%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero p {
+  margin-top: 16px; color: var(--text2); font-size: 15px; line-height: 1.7; max-width: 46ch;
+}
+.feature-row {
+  display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px;
+  margin-top: 36px;
+}
+.feature {
+  padding: 14px 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(22,27,34,.72);
+  backdrop-filter: blur(8px);
+  transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
+}
+.feature:hover {
+  transform: translateY(-3px);
+  border-color: rgba(88,166,255,.45);
+  box-shadow: 0 12px 28px rgba(0,0,0,.28);
+}
+.feature .ico { font-size: 18px; margin-bottom: 8px; }
+.feature .t { color: var(--text3); font-weight: 650; font-size: 13px; }
+.feature .d { color: var(--text2); font-size: 12px; margin-top: 4px; line-height: 1.45; }
+
+.brand-foot {
+  color: var(--text2); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
+}
+.brand-foot .pill {
+  padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
+  background: rgba(28,33,40,.8);
+}
+
+.form-pane {
+  position: relative; z-index: 1;
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px 36px;
+  min-height: 100vh;
+}
+.form-pane::before {
+  content: "";
+  position: absolute; inset: 8% 10% 8% 0; border-radius: 24px 0 0 24px;
+  background: linear-gradient(180deg, rgba(22,27,34,.55), rgba(13,17,23,.35));
+  border: 1px solid rgba(48,54,61,.65); border-right: none;
+  box-shadow: -20px 0 60px rgba(0,0,0,.25);
+  pointer-events: none;
+}
+.card {
+  position: relative;
+  width: min(420px, 100%);
+  padding: 32px 30px 28px;
+  border-radius: 16px;
+  background: linear-gradient(165deg, rgba(28,33,40,.96), rgba(22,27,34,.94));
+  border: 1px solid rgba(88,166,255,.22);
+  box-shadow:
+    0 0 0 1px rgba(255,255,255,.02) inset,
+    0 24px 48px rgba(0,0,0,.4),
+    0 0 80px rgba(88,166,255,.08);
+  animation: cardIn .55s ease-out;
+}
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(12px) scale(.98); }
+  to { opacity: 1; transform: none; }
+}
+.card-head { margin-bottom: 22px; }
+.card-head h2 { color: var(--text3); font-size: 22px; font-weight: 720; }
+.card-head p { color: var(--text2); font-size: 13px; margin-top: 6px; }
+.field { margin-bottom: 14px; }
+.field label {
+  display: block; font-size: 12px; color: var(--text2); margin-bottom: 6px; font-weight: 600;
+}
+.field input, .field select {
+  width: 100%; height: 44px; padding: 0 14px;
+  border-radius: 10px; border: 1px solid var(--border);
+  background: rgba(13,17,23,.85); color: var(--text3);
+  outline: none; font-size: 14px;
+  transition: border-color .2s, box-shadow .2s, background .2s;
+}
+.field input:focus, .field select:focus {
+  border-color: rgba(88,166,255,.7);
+  box-shadow: 0 0 0 3px rgba(88,166,255,.15);
+  background: rgba(13,17,23,.95);
+}
+.field input::placeholder { color: #6e7681; }
+.row-opts {
+  display: flex; justify-content: space-between; align-items: center;
+  margin: 6px 0 16px; font-size: 12px; color: var(--text2);
+}
+.row-opts label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.err {
+  display: none; margin-bottom: 12px; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid rgba(248,81,73,.4); background: rgba(248,81,73,.1);
+  color: #ff7b72; font-size: 13px; line-height: 1.45;
+}
+.err.show { display: block; }
+.btn-login {
+  width: 100%; height: 46px; border: 0; border-radius: 10px; cursor: pointer;
+  font-size: 15px; font-weight: 700; color: #041018;
+  background: linear-gradient(90deg, #58a6ff, #3fb950);
+  box-shadow: 0 10px 24px rgba(88,166,255,.28);
+  transition: transform .15s ease, filter .15s ease, box-shadow .15s ease;
+}
+.btn-login:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.05);
+  box-shadow: 0 14px 28px rgba(88,166,255,.35);
+}
+.btn-login:disabled { opacity: .65; cursor: wait; }
+.btn-login .spin {
+  display: none; width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid rgba(4,16,24,.25); border-top-color: #041018;
+  animation: spin .7s linear infinite; margin-right: 8px; vertical-align: -3px;
+}
+.btn-login.loading .spin { display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.card-foot {
+  margin-top: 18px; text-align: center; color: var(--text2); font-size: 12px; line-height: 1.5;
+}
+.card-foot code { color: var(--blue); font-size: 11px; }
+
+@media (max-width: 960px) {
+  .stage { grid-template-columns: 1fr; }
+  .brand-pane { min-height: auto; padding: 28px 22px 12px; }
+  .hero { margin-top: 24px; }
+  .feature-row { grid-template-columns: 1fr; }
+  .form-pane { min-height: auto; padding: 12px 18px 36px; }
+  .form-pane::before { display: none; }
+  body { overflow: auto; }
+}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="aurora"></div>
+  <div class="grid-fx"></div>
+
+  <section class="brand-pane">
+    <div class="brand-top">
+      <div class="logo-mark">QA</div>
+      <div class="logo-text">
+        PCB智能品质分析
+        <small>Quality Intelligence · v2.0</small>
+      </div>
+    </div>
+
+    <div class="hero">
+      <div class="hero-kicker"><span>●</span> ERP / MES 统一账号登录</div>
+      <h1>洞见品质脉搏<br><span>驱动改善闭环</span></h1>
+      <p>对接 ERP/MES 实据与 GraphRAG 知识库，覆盖报废深挖、IPQC、SPC、8D 智能生成与预警闭环——登录后进入决策驾驶舱。</p>
+      <div class="feature-row">
+        <div class="feature">
+          <div class="ico">📊</div>
+          <div class="t">品质总览</div>
+          <div class="d">良率 / 报废 / 闭环时效一眼掌握</div>
+        </div>
+        <div class="feature">
+          <div class="ico">✨</div>
+          <div class="t">8D 智能生成</div>
+          <div class="d">LangGraph 闭环产出 D1–D8 草稿</div>
+        </div>
+        <div class="feature">
+          <div class="ico">🧠</div>
+          <div class="t">知识沉淀</div>
+          <div class="d">GraphRAG 根因对策可追溯</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="brand-foot">
+      <span class="pill" id="envPill">环境检测中…</span>
+      <span>使用制造执行系统同一账号</span>
+    </div>
+  </section>
+
+  <section class="form-pane">
+    <form class="card" id="loginForm" autocomplete="on">
+      <div class="card-head">
+        <h2>欢迎回来</h2>
+        <p>请使用 ERP/MES 账号登录品质分析系统</p>
+      </div>
+
+      <div class="err" id="errBox"></div>
+
+      <div class="field">
+        <label for="enterprise">企业编码</label>
+        <select id="enterprise" name="enterprise_code"></select>
+      </div>
+      <div class="field">
+        <label for="username">账号</label>
+        <input id="username" name="username" type="text" placeholder="请输入账号" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" placeholder="请输入密码" autocomplete="current-password" required>
+      </div>
+
+      <div class="row-opts">
+        <label><input type="checkbox" id="remember"> 记住账号</label>
+        <span id="hintEnv" style="opacity:.85;"></span>
+      </div>
+
+      <button class="btn-login" id="btnLogin" type="submit">
+        <span class="spin"></span><span id="btnText">登 录</span>
+      </button>
+
+      <div class="card-foot">
+        登录将校验 ERP/MES <code>/api/auth/login</code><br>
+        会话安全保存在本系统 Cookie，关闭浏览器后仍可保持登录
+      </div>
+    </form>
+  </section>
+</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const errBox = $('errBox');
+  const btn = $('btnLogin');
+  const btnText = $('btnText');
+  const sel = $('enterprise');
+  const userEl = $('username');
+  const passEl = $('password');
+
+  function showErr(msg) {
+    errBox.textContent = msg || '登录失败';
+    errBox.classList.add('show');
+  }
+  function clearErr() { errBox.classList.remove('show'); errBox.textContent = ''; }
+
+  function setLoading(on) {
+    btn.disabled = !!on;
+    btn.classList.toggle('loading', !!on);
+    btnText.textContent = on ? '登录中…' : '登 录';
+  }
+
+  async function loadConfig() {
+    try {
+      const r = await fetch('/api/auth/config', { signal: AbortSignal.timeout(8000) });
+      const d = await r.json();
+      const list = (d && d.enterprises) || ['江西中软电子有限公司'];
+      const def = (d && d.default_enterprise) || list[0];
+      sel.innerHTML = list.map(x => {
+        const v = String(x).replace(/"/g, '&quot;');
+        return `<option value="${v}">${v}</option>`;
+      }).join('');
+      sel.value = def;
+      const env = (d && d.env) || 'test';
+      const envLabel = env === 'prod' ? '生产环境' : '测试环境';
+      $('envPill').textContent = envLabel;
+      $('hintEnv').textContent = envLabel;
+      document.title = `登录 · ${(d && d.system_name) || 'PCB智能品质分析系统'}`;
+    } catch (e) {
+      sel.innerHTML = '<option value="江西中软电子有限公司">江西中软电子有限公司</option>';
+      $('envPill').textContent = '配置加载失败';
+    }
+    try {
+      const saved = localStorage.getItem('qa_login_user');
+      if (saved) { userEl.value = saved; $('remember').checked = true; }
+      const ent = localStorage.getItem('qa_login_enterprise');
+      if (ent && [...sel.options].some(o => o.value === ent)) sel.value = ent;
+    } catch (e) {}
+  }
+
+  $('loginForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    clearErr();
+    const username = (userEl.value || '').trim();
+    const password = passEl.value || '';
+    const enterprise_code = sel.value || '';
+    if (!username || !password) { showErr('请输入账号和密码'); return; }
+    setLoading(true);
+    const q = new URLSearchParams(location.search);
+    const nextRaw = q.get('next') || '/pcb_quality_system.html';
+    try {
+      const r = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, enterprise_code, next: nextRaw }),
+        signal: AbortSignal.timeout(20000),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.success) {
+        showErr((d && d.error) || '账号或密码错误');
+        setLoading(false);
+        return;
+      }
+      try {
+        if ($('remember').checked) {
+          localStorage.setItem('qa_login_user', username);
+          localStorage.setItem('qa_login_enterprise', enterprise_code);
+        } else {
+          localStorage.removeItem('qa_login_user');
+          localStorage.removeItem('qa_login_enterprise');
+        }
+      } catch (e) {}
+      // 优先用服务端白名单校验后的 next；客户端再兜底一次
+      let next = String((d && d.next) || nextRaw || '').trim();
+      const safe =
+        next.startsWith('/') &&
+        !next.startsWith('//') &&
+        !next.includes('\\') &&
+        !next.includes('://') &&
+        !next.includes('..') &&
+        ['/pcb_quality_system.html', '/login.html', '/', '/index'].some(
+          (p) => next === p || next.startsWith(p + '?')
+        );
+      location.replace(safe ? next.split('#')[0] : '/pcb_quality_system.html');
+    } catch (e) {
+      showErr('网络异常：' + (e.message || e));
+      setLoading(false);
+    }
+  });
+
+  loadConfig();
+  // 已有用户会话则直达系统（服务令牌不算页面已登录）
+  fetch('/api/auth/me', { signal: AbortSignal.timeout(5000) })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      if (d && d.success && d.user && d.auth === 'session') {
+        location.replace('/pcb_quality_system.html');
+      }
+    })
+    .catch(() => {});
+})();
+</script>
+</body>
+</html>

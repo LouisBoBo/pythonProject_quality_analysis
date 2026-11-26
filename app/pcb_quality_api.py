@@ -67,12 +67,37 @@ from config.settings import (  # noqa: E402
     TARGET_REWORK_RATE,
     ALERT_OVERDUE_HOURS,
     EIGHT_D_OVERDUE_DAYS,
+    EIGHT_D_API_BASE,
+    EIGHT_D_API_KEY,
+    EIGHT_D_API_TIMEOUT,
+    EIGHT_D_API_ENV,
+    ERP_AUTH_BASE,
+    ERP_AUTH_TIMEOUT,
+    REQUIRE_LOGIN,
+    SESSION_TTL_SECONDS,
+    COOKIE_SECURE_MODE,
+    LOGIN_ENTERPRISES,
+)
+from config.env_profiles import (  # noqa: E402
+    ACTIVE_ENV,
+    resolve_eight_d_api,
+    resolve_erp_auth,
 )
 from graphrag_client import get_graphrag_client, reset_graphrag_client  # noqa: E402
 from app.project_env import (  # noqa: E402
     describe_for_api,
     get_active_context,
     resolve_paths,
+)
+from app.auth_session import (  # noqa: E402
+    DEFAULT_ENTERPRISES,
+    check_login_rate_limit,
+    clear_login_failures,
+    erp_login,
+    get_session_store,
+    record_login_failure,
+    safe_internal_next,
+    session_cookie_header,
 )
 
 BASE_DIR = PROJECT_ROOT
@@ -5305,6 +5330,304 @@ class PCBQualitySystem:
 
 
 # ═══════════════════════════════════════════════════
+# 对外 8D 服务（POST /api/v1/8d/generate）代理与字段映射
+# ═══════════════════════════════════════════════════
+
+class External8DError(Exception):
+    """调用对外 8D 接口失败。"""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = int(status or 502)
+        self.message = message or "8D 服务错误"
+
+
+def _ext8d_join_lines(items) -> str:
+    if not items:
+        return ""
+    if isinstance(items, str):
+        return items.strip()
+    lines = []
+    for i, item in enumerate(items, 1):
+        text = str(item or "").strip()
+        if text:
+            lines.append(f"{i}. {text}")
+    return "\n".join(lines)
+
+
+def flatten_external_8d_report(
+    report: dict,
+    part_no: str,
+    problem_desc: str,
+    extra: Optional[dict] = None,
+) -> dict:
+    """
+    将对外 8D 的 ReportContent（meta + d1_team~d8_closure）压成品质分析本地扁平行。
+    同步写入实据快照（D2/MES 摘要）与知识库摘要（D4 根因 / D5 对策），供编辑页直接展示。
+    """
+    report = report if isinstance(report, dict) else {}
+    extra = extra if isinstance(extra, dict) else {}
+    meta = report.get("meta") if isinstance(report.get("meta"), dict) else {}
+    d1 = report.get("d1_team") if isinstance(report.get("d1_team"), dict) else {}
+    d2 = report.get("d2_problem") if isinstance(report.get("d2_problem"), dict) else {}
+    d3 = report.get("d3_containment") if isinstance(report.get("d3_containment"), dict) else {}
+    d4 = report.get("d4_root_cause") if isinstance(report.get("d4_root_cause"), dict) else {}
+    d5 = report.get("d5_corrective") if isinstance(report.get("d5_corrective"), dict) else {}
+    d6 = report.get("d6_verification") if isinstance(report.get("d6_verification"), dict) else {}
+    d7 = report.get("d7_prevention") if isinstance(report.get("d7_prevention"), dict) else {}
+    d8 = report.get("d8_closure") if isinstance(report.get("d8_closure"), dict) else {}
+
+    # 兼容已是扁平 d1~d8 的返回
+    if report.get("d1") and not d1.get("content"):
+        return {
+            "id": report.get("id") or f"8D-{part_no[:8]}-{int(time.time())}",
+            "report_no": report.get("report_no") or report.get("id") or "",
+            "part_number": report.get("part_number") or part_no,
+            "customer": report.get("customer") or "",
+            "problem": report.get("problem") or problem_desc,
+            "d1": report.get("d1") or "",
+            "d2": report.get("d2") or "",
+            "d3": report.get("d3") or "",
+            "d4": report.get("d4") or "",
+            "d5": report.get("d5") or "",
+            "d6": report.get("d6") or "",
+            "d7": report.get("d7") or "",
+            "d8": report.get("d8") or "",
+            "defects_json": report.get("defects_json") or "[]",
+            "evidence_json": report.get("evidence_json") or "{}",
+            "history_refs_json": report.get("history_refs_json") or "[]",
+            "knowledge_refs_json": report.get("knowledge_refs_json") or "{}",
+            "data_policy": report.get("data_policy") or "external=langgraph;/api/v1/8d/generate",
+            "status": report.get("status") or "open",
+            "severity": int(report.get("severity") or 3),
+            "created_by": report.get("created_by") or "LangGraph-8D",
+            "created_at": report.get("created_at") or datetime.now().isoformat(),
+        }
+
+    why_chain = []
+    why_lines = []
+    for step in (d4.get("why_chain") or []):
+        if not isinstance(step, dict):
+            continue
+        why = str(step.get("why") or "").strip()
+        ans = str(step.get("answer") or "").strip()
+        if why or ans:
+            why_chain.append({"why": why, "answer": ans})
+        if why:
+            why_lines.append(f"↓ {why}")
+        if ans:
+            why_lines.append(f"→ {ans}")
+
+    d2_parts = []
+    if d2.get("product"):
+        d2_parts.append(f"【产品】{d2.get('product')}")
+    if d2.get("phenomenon"):
+        d2_parts.append(f"【现象】{d2.get('phenomenon')}")
+    if d2.get("discovery_process"):
+        d2_parts.append(f"【发现工序】{d2.get('discovery_process')}")
+    if d2.get("affected_qty"):
+        d2_parts.append(f"【影响数量】{d2.get('affected_qty')}")
+    d2_text = "\n".join(d2_parts)
+
+    d3_title = (d3.get("title") or "").strip()
+    d3_items = _ext8d_join_lines(d3.get("items") or [])
+    d3_text = (f"【{d3_title}】\n{d3_items}" if d3_title else d3_items).strip()
+
+    d4_ph = str(d4.get("defect_phenomenon") or "").strip()
+    d4_text = "\n".join(
+        x for x in [
+            f"不良现象：{d4_ph}" if d4_ph else "",
+            *why_lines,
+        ] if x
+    )
+
+    d5_items = [
+        str(x).strip() for x in (d5.get("items") or []) if str(x or "").strip()
+    ]
+    d5_text = _ext8d_join_lines(d5_items)
+    d6_crit = _ext8d_join_lines(d6.get("criteria") or [])
+    d6_text = ("【验收标准】\n" + d6_crit).strip() if d6_crit else ""
+    d7_text = _ext8d_join_lines(d7.get("items") or [])
+    d8_conf = _ext8d_join_lines(d8.get("confirmations") or [])
+    d8_text = ("【团队成果确认】\n" + d8_conf).strip() if d8_conf else ""
+
+    ts = int(time.time())
+    safe_part = re.sub(r"[^\w\-]+", "", part_no)[:12] or "PART"
+    rid = f"8D-{safe_part}-{ts}"
+    c8d = (meta.get("c8d_number") or "").strip()
+    report_no = c8d or f"QHC-8D-{datetime.now().strftime('%Y%m%d')}-{hashlib.md5(rid.encode()).hexdigest()[:4].upper()}"
+    problem = (
+        (meta.get("summary") or "").strip()
+        or (meta.get("abnormal_reason") or "").strip()
+        or problem_desc
+    )
+    status_raw = (meta.get("status") or "进行中").strip()
+    status = "closed" if status_raw in ("已关闭", "closed") else "open"
+
+    phenomenon = (
+        str(d2.get("phenomenon") or "").strip()
+        or d4_ph
+        or problem_desc
+    )
+    process_name = str(d2.get("discovery_process") or "").strip()
+    defects = []
+    if phenomenon:
+        defects.append({
+            "defect_type": phenomenon,
+            "process_name": process_name,
+            "scrap_pcs": None,
+            "source": "external_8d_d2",
+        })
+
+    round_logs = extra.get("round_logs") if isinstance(extra.get("round_logs"), list) else []
+    evidence = {
+        "kind": "external_langgraph",
+        "source": "external_8d_api",
+        "endpoint": "/api/v1/8d/generate",
+        "engine": extra.get("engine") or "langgraph",
+        "part_no": (meta.get("part_no") or part_no).strip() or part_no,
+        "problem_desc": problem_desc,
+        "customer": (meta.get("customer") or "").strip(),
+        "product": str(d2.get("product") or "").strip(),
+        "phenomenon": phenomenon,
+        "discovery_process": process_name,
+        "affected_qty": str(d2.get("affected_qty") or "").strip(),
+        "d3_title": d3_title,
+        "d3_items": list(d3.get("items") or [])[:8],
+        "defects": defects,
+        "qualified": extra.get("qualified") or "",
+        "total_score": extra.get("total_score"),
+        "ok": bool(extra.get("ok")),
+        "thread_id": extra.get("thread_id") or "",
+        "elapsed_s": extra.get("elapsed_s"),
+        "round_logs": round_logs[-12:],
+        "data_sources": "MES + FMEA GraphRAG + LangGraph",
+        "meta": {
+            "c8d_number": c8d,
+            "summary": (meta.get("summary") or "").strip(),
+            "abnormal_reason": (meta.get("abnormal_reason") or "").strip(),
+            "status": status_raw,
+        },
+    }
+
+    # 知识库区：直接展示本次智能生成写入的根因 / 对策（已进入 D4/D5）
+    knowledge_pack = {
+        "source": "LangGraph-8D / FMEA GraphRAG",
+        "source_url": GRAPHRAG_BASE_URL,
+        "applied": True,
+        "hit_count": 1 if (why_chain or d5_items) else 0,
+        "cause_count": len(why_chain),
+        "measure_count": len(d5_items),
+        "refs": [],
+    }
+    if why_chain or d5_items:
+        knowledge_pack["refs"] = [{
+            "matched": phenomenon or problem_desc or part_no,
+            "query": problem_desc,
+            "match_type": "langgraph_applied",
+            "processes": [process_name] if process_name else [],
+            "root_causes": [
+                {
+                    "cause": (x.get("answer") or "").strip(),
+                    "category": (x.get("why") or "").strip(),
+                    "why": (x.get("why") or "").strip(),
+                }
+                for x in why_chain
+                if (x.get("answer") or "").strip()
+            ],
+            "countermeasures": [
+                {"measure": m, "standard": ""} for m in d5_items
+            ],
+            "source": "智能生成已写入 D4/D5（须现场复核）",
+            "evidence": f"料号 {part_no} · {phenomenon or problem_desc}",
+        }]
+
+    return {
+        "id": rid,
+        "report_no": report_no,
+        "part_number": (meta.get("part_no") or part_no).strip() or part_no,
+        "customer": (meta.get("customer") or "").strip(),
+        "problem": problem,
+        "d1": str(d1.get("content") or "").strip(),
+        "d2": d2_text,
+        "d3": d3_text,
+        "d4": d4_text,
+        "d5": d5_text,
+        "d6": d6_text,
+        "d7": d7_text,
+        "d8": d8_text,
+        "defects_json": json.dumps(defects, ensure_ascii=False),
+        "evidence_json": json.dumps(evidence, ensure_ascii=False, default=str),
+        "history_refs_json": "[]",
+        "knowledge_refs_json": json.dumps(knowledge_pack, ensure_ascii=False),
+        "data_policy": "external=langgraph;/api/v1/8d/generate;review_required=1",
+        "status": status,
+        "severity": 3,
+        "created_by": "LangGraph-8D",
+        "created_at": datetime.now().isoformat(),
+    }
+
+
+def call_external_8d_generate(payload: dict) -> dict:
+    """同步调用对外 8D 生成接口，返回 JSON 字典。
+
+    入口按当前 QA_ENV 解析：测试→本机 8001；生产→公网 :18880。二者禁止混用。
+    """
+    import urllib.error
+    import urllib.request
+
+    eight = resolve_eight_d_api()
+    base = (eight.get("base") or EIGHT_D_API_BASE or "").rstrip("/")
+    api_key = (eight.get("api_key") if eight.get("api_key") is not None else EIGHT_D_API_KEY) or ""
+    env_name = eight.get("env") or EIGHT_D_API_ENV or "test"
+    if not base:
+        raise External8DError(500, f"未配置 {env_name} 环境 8D 入口（QA_*_8D_API_BASE）")
+
+    url = f"{base}/api/v1/8d/generate"
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+    }
+    if api_key:
+        headers["X-API-Key"] = api_key
+    logger.info("调用 8D 生成 env=%s base=%s", env_name, base)
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    timeout = max(30.0, float(EIGHT_D_API_TIMEOUT or 180))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            code = getattr(resp, "status", None) or resp.getcode()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+            parsed = json.loads(err_body) if err_body else {}
+            detail = parsed.get("detail") or parsed.get("error") or err_body
+            if isinstance(detail, list):
+                detail = "; ".join(
+                    str(x.get("msg") or x) if isinstance(x, dict) else str(x)
+                    for x in detail
+                )
+        except Exception:
+            detail = str(e)
+        raise External8DError(e.code or 502, detail or f"8D 服务 HTTP {e.code}") from e
+    except urllib.error.URLError as e:
+        raise External8DError(
+            502,
+            f"无法连接 8D 服务 [{env_name}] {base}（请确认已启动）：{e.reason}",
+        ) from e
+
+    try:
+        result = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as e:
+        raise External8DError(502, f"8D 服务返回非 JSON（HTTP {code}）") from e
+    if not isinstance(result, dict):
+        raise External8DError(502, "8D 服务返回格式异常")
+    return result
+
+
+# ═══════════════════════════════════════════════════
 # 请求参数校验（阻断 SQL 注入：只接受合法格式，拒绝引号/注释/控制字符）
 # ═══════════════════════════════════════════════════
 
@@ -5358,8 +5681,11 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        # 令牌引导：/pcb_quality_system.html?token=xxx → 校验通过后下发 Cookie 并重定向去掉令牌
+        # 令牌引导：仅在未强制登录时允许 ?token= 写入 Cookie（强制登录须走 ERP 会话）
         if path.endswith(".html") and params.get("token"):
+            if REQUIRE_LOGIN:
+                self._redirect("/login.html")
+                return
             self._bootstrap_token(path, params["token"][0])
             return
 
@@ -5368,13 +5694,27 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             if invalid:
                 self._err(400, invalid)
                 return
-            if (path.startswith("/api/") or path.startswith("/download/")) and not self._authorized():
-                if path == "/api/health":
-                    self._health(public=True)
-                else:
-                    self._err(401, "需要访问令牌：请用 ?token= 打开页面，或携带 X-API-Token 头")
-                return
 
+            # 公开接口（登录页 / 健康检查）
+            public_api = path in (
+                "/api/auth/login",
+                "/api/auth/config",
+                "/api/health",
+            )
+            if path.startswith("/api/") or path.startswith("/download/"):
+                if path == "/api/health" and not self._authorized():
+                    self._health(public=True)
+                    return
+                if not public_api and not self._authorized():
+                    self._err(401, "未登录：请先打开 /login.html 使用 ERP/MES 账号登录")
+                    return
+
+            if path == "/api/auth/config":
+                self._auth_config()
+                return
+            if path == "/api/auth/me":
+                self._auth_me()
+                return
             if path == "/api/health":
                 self._health()
             elif path == "/api/project/env":
@@ -5424,16 +5764,27 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 # 分析页 Excel 导出：module=scrap|ipqc|spc|copq|health|process
                 self._export_excel(params)
             elif path == "/" or path == "/index":
-                # 重定向到HTML前端
+                # 已登录进系统，否则进登录页
+                loc = (
+                    "/pcb_quality_system.html"
+                    if self._page_authorized()
+                    else "/login.html"
+                )
                 self.send_response(302)
-                self.send_header("Location", "/pcb_quality_system.html")
+                self.send_header("Location", loc)
                 self.end_headers()
             elif path.startswith("/download/"):
                 # 浏览器下载走 GET
                 filename = path.split("/download/", 1)[1]
                 self._download_file(filename)
             elif path.endswith(".html") or path.endswith(".css") or path.endswith(".js"):
-                # 静态文件服务
+                # 主系统页需用户会话；登录页仅在已有会话时跳转系统
+                if path.endswith("pcb_quality_system.html") and not self._page_authorized():
+                    self._redirect("/login.html")
+                    return
+                if path.endswith("login.html") and self._page_authorized():
+                    self._redirect("/pcb_quality_system.html")
+                    return
                 self._serve_static(path)
             else:
                 self._err(404, "接口不存在")
@@ -5447,13 +5798,19 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
 
         try:
+            if path == "/api/auth/login":
+                self._auth_login(body)
+                return
+            if path == "/api/auth/logout":
+                self._auth_logout()
+                return
             if not self._authorized():
-                self._err(401, "需要访问令牌：请用 ?token= 打开页面，或携带 X-API-Token 头")
+                self._err(401, "未登录：请先打开 /login.html 使用 ERP/MES 账号登录")
                 return
             params = {k: [v] for k, v in (body or {}).items()}
             # 仅对会进入 SQL 拼接的参数做校验；8D/学习正文走参数化存储，不限制标点
             if path in (
-                "/api/8d/generate", "/api/8d/delete", "/api/8d/purge_invalid",
+                "/api/8d/delete", "/api/8d/purge_invalid",
                 "/api/alerts/scan", "/api/alerts/ack", "/api/alerts/ack_batch",
                 "/api/history/purge_empty", "/api/export",
             ):
@@ -5463,7 +5820,9 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                     return
 
             if path == "/api/8d/generate":
-                self._8d_generate(params)
+                # 入参：part_no + problem_desc（兼容旧字段 part / abnormal_reason）
+                # 转发至对外 8D 服务；问题描述含标点，不做 SQL 字符校验
+                self._8d_generate(body)
             elif path == "/api/8d/delete":
                 self._8d_delete(params)
             elif path == "/api/8d/purge_invalid":
@@ -5501,28 +5860,195 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
 
     # ─── 鉴权 ────────────────────────────────────────
 
-    def _cookie_token(self) -> str:
+    def _cookie_value(self, name: str) -> str:
         raw = self.headers.get("Cookie") or ""
         for part in raw.split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == "qa_token":
+            k, _, value = part.strip().partition("=")
+            if k == name:
                 return value.strip()
         return ""
 
-    def _authorized(self) -> bool:
-        if not API_TOKEN:
+    def _cookie_token(self) -> str:
+        return self._cookie_value("qa_token")
+
+    def _session_id(self) -> str:
+        return self._cookie_value("qa_sid")
+
+    def _current_session(self):
+        return get_session_store(SESSION_TTL_SECONDS).get(self._session_id())
+
+    def _client_ip(self) -> str:
+        xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff:
+            return xff
+        return (self.client_address[0] if self.client_address else "") or "unknown"
+
+    def _cookie_secure(self) -> bool:
+        mode = (COOKIE_SECURE_MODE or "auto").strip().lower()
+        if mode in ("1", "true", "yes", "on"):
             return True
+        if mode in ("0", "false", "no", "off"):
+            return False
+        # auto：反向代理 HTTPS 或本连接已是 https 语义
+        proto = (self.headers.get("X-Forwarded-Proto") or "").strip().lower()
+        if proto == "https":
+            return True
+        return False
+
+    def _has_api_token(self, *, allow_cookie: bool = True) -> bool:
+        if not API_TOKEN:
+            return False
         supplied = (self.headers.get("X-API-Token") or "").strip()
         auth = (self.headers.get("Authorization") or "").strip()
         if not supplied and auth.lower().startswith("bearer "):
             supplied = auth[7:].strip()
-        if not supplied:
+        if not supplied and allow_cookie:
             supplied = self._cookie_token()
         return bool(supplied) and hmac.compare_digest(supplied, API_TOKEN)
 
+    def _authorized(self) -> bool:
+        # 1) ERP/MES 登录会话
+        if self._current_session() is not None:
+            return True
+        # 2) 服务令牌：强制登录时仅允许 Header（禁止 Cookie 冒充浏览器会话）
+        if self._has_api_token(allow_cookie=not REQUIRE_LOGIN):
+            return True
+        # 3) 未强制登录且未配置令牌 → 开发免登
+        if not REQUIRE_LOGIN and not API_TOKEN:
+            return True
+        return False
+
+    def _page_authorized(self) -> bool:
+        """主系统 HTML：强制登录时必须有用户会话（不用服务令牌冒充已登录）。"""
+        if self._current_session() is not None:
+            return True
+        if not REQUIRE_LOGIN:
+            return self._authorized()
+        return False
+
+    def _auth_config(self):
+        """登录页配置：企业列表与环境标签（公开）。"""
+        enterprises = list(LOGIN_ENTERPRISES or DEFAULT_ENTERPRISES)
+        erp = resolve_erp_auth()
+        self._ok({
+            "enterprises": enterprises,
+            "default_enterprise": enterprises[0] if enterprises else "江西中软电子有限公司",
+            "env": erp.get("env") or ACTIVE_ENV,
+            "require_login": bool(REQUIRE_LOGIN),
+            "system_name": "PCB智能品质分析系统",
+            "version": VERSION,
+        })
+
+    def _auth_login(self, body: dict):
+        """
+        用户登录（代理 ERP/MES）。
+
+        入参：username / password / enterprise_code（可选）
+        成功：写入 HttpOnly 会话 Cookie qa_sid，返回用户信息。
+        """
+        body = body or {}
+        client_ip = self._client_ip()
+        limited = check_login_rate_limit(client_ip)
+        if limited:
+            self._err(429, limited)
+            return
+        username = str(body.get("username") or body.get("user") or body.get("account") or "").strip()
+        password = str(body.get("password") or "")
+        enterprise = str(
+            body.get("enterprise_code")
+            or body.get("enterpriseCode")
+            or ""
+        ).strip()
+        if not username or not password:
+            self._err(400, "请输入账号和密码")
+            return
+        erp = resolve_erp_auth()
+        base = (erp.get("base") or ERP_AUTH_BASE).rstrip("/")
+        try:
+            result = erp_login(
+                base,
+                username,
+                password,
+                enterprise,
+                timeout=ERP_AUTH_TIMEOUT,
+            )
+        except PermissionError as e:
+            record_login_failure(client_ip)
+            self._err(401, str(e) or "账号或密码错误")
+            return
+        except ConnectionError as e:
+            self._err(502, str(e))
+            return
+        except Exception as e:
+            logger.exception("ERP 登录失败: %s", e)
+            self._err(502, f"登录失败：{e}")
+            return
+
+        clear_login_failures(client_ip)
+        store = get_session_store(SESSION_TTL_SECONDS)
+        sess = store.create(
+            result["username"],
+            enterprise_code=result.get("enterprise_code") or enterprise,
+            role=result.get("role") or "",
+            erp_token=result.get("access_token") or "",
+        )
+        cookie = session_cookie_header(
+            sess.sid,
+            max_age=SESSION_TTL_SECONDS,
+            secure=self._cookie_secure(),
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", cookie)
+        self._cors_headers()
+        payload = json.dumps({
+            "success": True,
+            "user": sess.to_public(),
+            "message": "登录成功",
+            "env": erp.get("env") or ACTIVE_ENV,
+            "next": safe_internal_next(str(body.get("next") or "")),
+        }, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _auth_logout(self):
+        """退出登录：清除会话 Cookie。"""
+        sid = self._session_id()
+        if sid:
+            get_session_store(SESSION_TTL_SECONDS).delete(sid)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Set-Cookie",
+            session_cookie_header(
+                "", max_age=0, clear=True, secure=self._cookie_secure()
+            ),
+        )
+        self._cors_headers()
+        payload = json.dumps({"success": True, "message": "已退出登录"}, ensure_ascii=False).encode("utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _auth_me(self):
+        """当前登录用户。"""
+        sess = self._current_session()
+        if sess:
+            self._ok({"user": sess.to_public(), "auth": "session"})
+            return
+        # 强制登录时 /me 不把服务令牌当成「已登录用户」（避免登录页误跳转）
+        if not REQUIRE_LOGIN and API_TOKEN and self._has_api_token(allow_cookie=True):
+            self._ok({
+                "user": {"username": "service", "role": "token", "enterprise_code": ""},
+                "auth": "api_token",
+            })
+            return
+        self._err(401, "未登录")
+
     def _bootstrap_token(self, path: str, token: str) -> None:
         if not API_TOKEN:
-            self._redirect(path)
+            self._redirect(safe_internal_next(path))
             return
         if not hmac.compare_digest((token or "").strip(), API_TOKEN):
             self.send_response(403)
@@ -5533,15 +6059,19 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 "<p>请输入 .env 中 QA_API_TOKEN 的值后重试。</p>".encode("utf-8")
             )
             return
-        cookie = f"qa_token={API_TOKEN}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"
+        secure = "; Secure" if self._cookie_secure() else ""
+        cookie = (
+            f"qa_token={API_TOKEN}; HttpOnly; SameSite=Lax; Path=/; "
+            f"Max-Age=2592000{secure}"
+        )
         self.send_response(302)
         self.send_header("Set-Cookie", cookie)
-        self.send_header("Location", path)
+        self.send_header("Location", safe_internal_next(path))
         self.end_headers()
 
     def _redirect(self, path: str) -> None:
         self.send_response(302)
-        self.send_header("Location", path)
+        self.send_header("Location", safe_internal_next(path))
         self.end_headers()
 
     # ─── 接口实现 ────────────────────────────────────
@@ -6137,44 +6667,113 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             logger.exception("静态文件错误 %s: %s", path, e)
             self._err(500, "静态文件读取失败")
 
-    def _8d_generate(self, params):
+    def _8d_generate(self, body):
         """
-        按 ERP/MES 实据生成 8D，并自动引用自主学习知识库（GraphRAG）根因/对策。
-        查询参数：part（必填）、start/end 或 fiscal_period/period。
+        智能生成 8D（对接对外接口 POST /api/v1/8d/generate）。
+
+        入参（JSON）：
+          - part_no / part：料号（必填）
+          - problem_desc / abnormal_reason / abnormal_desc：问题描述（必填）
+        行为：转发至 8D 服务 LangGraph 闭环；将 D1–D8 映射落本地库供编辑/导出。
         """
-        part = params.get("part", [""])[0]
-        start = params.get("start", [None])[0]
-        end = params.get("end", [None])[0]
-        period = params.get("period", [None])[0]
-        fiscal_period = params.get("fiscal_period", [None])[0]
-        if not part:
-            self._err(400, "缺少part参数")
-            return
-        r = self.system.generate_8d_report(
-            part, start, end, period=period, fiscal_period=fiscal_period
+        body = body or {}
+        part = (
+            body.get("part_no")
+            or body.get("part")
+            or body.get("part_number")
+            or ""
         )
-        if r.get("success") is False:
-            self._err(400, r.get("error") or "无法生成8D")
+        part = str(part).strip()
+        problem = (
+            body.get("problem_desc")
+            or body.get("abnormal_reason")
+            or body.get("abnormal_desc")
+            or body.get("problem")
+            or ""
+        )
+        problem = str(problem).strip()
+        if not part:
+            self._err(400, "缺少料号 part_no")
             return
-        hist_n = r.get("history_count") or len(r.get("history_refs") or [])
-        kb_n = r.get("knowledge_hit_count") or 0
-        parts = ["8D已基于 ERP/MES 实据生成"]
-        align = r.get("defect_alignment") or {}
-        if align.get("mapped_count"):
-            parts.append(f"缺陷对齐 {align.get('mapped_count')} 项")
-        if align.get("unmapped_count"):
-            parts.append(f"未对齐 {align.get('unmapped_count')} 项（可补 defect_mapping.json）")
-        if hist_n:
-            parts.append(f"引用历史关闭方案 {hist_n} 条")
-        if kb_n:
-            parts.append(f"引用知识库 GraphRAG {kb_n} 条（D4/D5 须现场复核）")
-        elif not hist_n:
-            parts.append("暂无历史/知识库命中，D4/D5 待现场填写或手动检索知识库")
+        if not problem:
+            self._err(400, "缺少问题描述 problem_desc")
+            return
+
+        payload = {"part_no": part, "problem_desc": problem}
+        if body.get("max_agent_rounds") is not None:
+            try:
+                payload["max_agent_rounds"] = int(body["max_agent_rounds"])
+            except (TypeError, ValueError):
+                self._err(400, "max_agent_rounds 须为 1–10 的整数")
+                return
+
+        try:
+            ext = call_external_8d_generate(payload)
+        except External8DError as e:
+            self._err(e.status, e.message)
+            return
+        except Exception as e:
+            logger.exception("调用对外 8D 服务失败: %s", e)
+            self._err(502, f"调用 8D 服务失败: {e}")
+            return
+
+        report_raw = ext.get("report") if isinstance(ext.get("report"), dict) else {}
+        flat = flatten_external_8d_report(
+            report_raw,
+            part,
+            problem,
+            extra={
+                "ok": bool(ext.get("ok")),
+                "qualified": ext.get("qualified") or "",
+                "total_score": ext.get("total_score"),
+                "round_logs": ext.get("round_logs") or [],
+                "thread_id": ext.get("thread_id") or "",
+                "elapsed_s": ext.get("elapsed_s"),
+                "engine": ext.get("engine") or "langgraph",
+            },
+        )
+        # 落本地库，便于列表/编辑/PDF（对外接口本身默认不落库）
+        self.system.db.save_8d(flat)
+        # 供前端编辑页直接使用结构化对象
+        try:
+            flat["evidence"] = json.loads(flat.get("evidence_json") or "{}")
+        except Exception:
+            flat["evidence"] = {}
+        try:
+            flat["knowledge_refs"] = json.loads(flat.get("knowledge_refs_json") or "{}")
+        except Exception:
+            flat["knowledge_refs"] = {}
+        try:
+            flat["defects"] = json.loads(flat.get("defects_json") or "[]")
+        except Exception:
+            flat["defects"] = []
+
+        msg = (ext.get("message") or "").strip() or "8D 已生成"
+        qualified = ext.get("qualified") or ""
+        total_score = ext.get("total_score")
+        ok = bool(ext.get("ok"))
+        if qualified or total_score is not None:
+            extra = " · ".join(
+                x for x in [
+                    qualified or None,
+                    f"{total_score}分" if total_score not in (None, "") else None,
+                ] if x
+            )
+            if extra and extra not in msg:
+                msg = f"{msg}（{extra}）"
+
         self._ok({
-            "report": r,
-            "message": "；".join(parts),
-            "purged_invalid": r.get("purged_invalid") or [],
-            "defect_alignment": align,
+            "report": flat,
+            "message": msg,
+            "ok": ok,
+            "qualified": qualified,
+            "total_score": total_score,
+            "round_logs": ext.get("round_logs") or [],
+            "thread_id": ext.get("thread_id") or "",
+            "elapsed_s": ext.get("elapsed_s"),
+            "engine": ext.get("engine") or "langgraph",
+            "external_part_no": ext.get("part_no") or part,
+            "external_problem_desc": ext.get("problem_desc") or problem,
         })
 
     def _8d_knowledge_lookup(self, params):
@@ -6612,7 +7211,19 @@ def main():
     print("  POST /api/sync/bridge     - 手动刷新生产桥接表", flush=True)
     print("  GET  /api/export/excel    - 分析页 Excel 导出", flush=True)
     print(f"  GraphRAG 数据源:         {GRAPHRAG_BASE_URL}", flush=True)
-    if API_TOKEN:
+    try:
+        _8d = resolve_eight_d_api()
+        print(
+            f"  8D 生成入口[{_8d.get('env')}]: {_8d.get('base')}",
+            flush=True,
+        )
+    except Exception:
+        print(f"  8D 生成入口:         {EIGHT_D_API_BASE}", flush=True)
+    if REQUIRE_LOGIN:
+        print("  访问方式: 打开 /login.html 使用 ERP/MES 账号登录", flush=True)
+        if API_TOKEN:
+            print("  自动化:   请求头 X-API-Token / Authorization: Bearer <QA_API_TOKEN>", flush=True)
+    elif API_TOKEN:
         print("  访问方式: 打开 /pcb_quality_system.html?token=<QA_API_TOKEN> 一次以写入 Cookie", flush=True)
     print("完整部署说明见 deploy/DEPLOY.md", flush=True)
     print("按 Ctrl+C 停止服务", flush=True)

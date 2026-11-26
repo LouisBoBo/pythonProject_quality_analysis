@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
 
@@ -21,6 +20,26 @@ from config.env_profiles import (
 )
 
 
+_SECRET_CONFIG_KEYS = frozenset({
+    "eight_d_api_key",
+    "api_key",
+    "password",
+    "secret",
+    "token",
+})
+
+
+def _public_config(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
+    """对外暴露的配置副本：剔除密钥类字段。"""
+    out: Dict[str, Any] = {}
+    for k, v in (cfg or {}).items():
+        lk = str(k).lower()
+        if lk in _SECRET_CONFIG_KEYS or lk.endswith("_key") or lk.endswith("_secret"):
+            continue
+        out[k] = v
+    return out
+
+
 def get_active_context() -> Dict[str, Any]:
     paths = resolve_active_paths()
     return {
@@ -28,7 +47,7 @@ def get_active_context() -> Dict[str, Any]:
         "project_name": "默认项目",
         "env": paths["env"],
         "env_label": paths["label"],
-        "config": deepcopy(paths["config"]),
+        "config": _public_config(paths.get("config")),
         "active_env_source": ".env 的 QA_ENV（或系统环境变量）",
     }
 
@@ -46,7 +65,8 @@ def describe_for_api() -> Dict[str, Any]:
         "project_name": "默认项目",
         "env": paths["env"],
         "env_label": paths["label"],
-        "config": deepcopy(paths["config"]),
+        # 禁止把 eight_d_api_key 等密钥回传前端
+        "config": _public_config(paths.get("config")),
         "resolved": {
             "erp_db_path": str(paths["erp"]),
             "mes_db_path": str(paths["mes"]),
@@ -56,6 +76,12 @@ def describe_for_api() -> Dict[str, Any]:
             "kb_exists": paths["kb"].exists(),
             "using_bridge_fallback": bool(paths.get("using_bridge_fallback")),
             "bridge_db": paths.get("bridge_db"),
+            "eight_d_api_base": paths.get("eight_d_api_base") or "",
+            "erp_auth_base": paths.get("erp_auth_base") or "",
+            "graphrag_url": paths.get("graphrag_url") or "",
+            "eight_d_api_key_configured": bool(
+                (paths.get("eight_d_api_key") or "").strip()
+            ),
         },
         "warnings": list(paths.get("warnings") or []),
         "env_keys": list(ENV_PROFILES.keys()),
@@ -64,6 +90,8 @@ def describe_for_api() -> Dict[str, Any]:
             "在项目根 .env 中设置 QA_ENV=test|prod 后重启服务；"
             "也可 export QA_ENV=...；前端不提供切换。"
             "生产请显式填写 QA_PROD_ERP_DB / QA_PROD_MES_DB。"
+            "8D：测试 QA_TEST_8D_API_BASE（默认本机:8001）；"
+            "生产 QA_PROD_8D_API_BASE（默认 http://175.178.238.31:18880）。"
         ),
     }
 
@@ -89,7 +117,9 @@ def get_project(_project_id=None):
         "id": "default",
         "name": "默认项目",
         "active_env": ctx["env"],
-        "environments": {k: dict(v) for k, v in ENV_PROFILES.items()},
+        "environments": {
+            k: _public_config(dict(v)) for k, v in ENV_PROFILES.items()
+        },
     }
 
 
