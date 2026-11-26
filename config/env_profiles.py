@@ -179,11 +179,11 @@ def resolve_active_paths(env: Optional[str] = None) -> Dict[str, Any]:
             warnings.append(f"生产 MES 库文件不存在: {mes_path}")
     eight_d_base = (cfg.get("eight_d_api_base") or "").strip().rstrip("/")
     if key == "prod":
-        # 生产误配到本机开发口时告警，仍保留配置值便于排查
-        if "127.0.0.1" in eight_d_base or "localhost" in eight_d_base or eight_d_base.endswith(":8001"):
+        # 同机生产常用 127.0.0.1:18801（pcb-8d 本机口）；仅对本机开发口 :8001 告警
+        if eight_d_base.rstrip("/").endswith(":8001") or "/8001" in eight_d_base:
             warnings.append(
                 f"生产 8D 入口疑似指向本机开发地址（{eight_d_base}）；"
-                f"请设 QA_PROD_8D_API_BASE={_DEFAULT_PROD_8D_API}"
+                f"同机请用 http://127.0.0.1:18801，或公网 {_DEFAULT_PROD_8D_API}"
             )
         if not (os.environ.get("QA_PROD_8D_API_BASE") or "").strip():
             # 使用默认公网入口，写进 resolved 便于核对
