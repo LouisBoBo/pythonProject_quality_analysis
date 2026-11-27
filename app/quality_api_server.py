@@ -7,6 +7,7 @@
 import sys
 import os
 import json
+import hmac
 import logging
 import decimal
 from pathlib import Path
@@ -34,10 +35,31 @@ logging.basicConfig(
 logger = logging.getLogger("QualityAPI")
 
 
+def _required_token() -> str:
+    """复用主服务的 QA_API_TOKEN；未配置时为空（仅本机监听）。"""
+    try:
+        from config.settings import API_TOKEN
+        return (API_TOKEN or "").strip()
+    except Exception:
+        return ""
+
+
 class QualityAPIHandler(BaseHTTPRequestHandler):
     """HTTP API 处理器"""
     
     system = None
+
+    def _authorized(self) -> bool:
+        """配置了 QA_API_TOKEN 时，须在请求头提供 X-API-Token / Bearer（禁用 URL 令牌）。"""
+        token = _required_token()
+        if not token:
+            return True
+        supplied = (self.headers.get('X-API-Token') or '').strip()
+        if not supplied:
+            auth = (self.headers.get('Authorization') or '').strip()
+            if auth.lower().startswith('bearer '):
+                supplied = auth[7:].strip()
+        return bool(supplied) and hmac.compare_digest(supplied, token)
     
     def do_GET(self):
         """处理GET请求"""
@@ -46,6 +68,9 @@ class QualityAPIHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         
         try:
+            if path != '/api/health' and not self._authorized():
+                self._send_error(401, "未授权：需提供 X-API-Token 或 Authorization: Bearer")
+                return
             if path == '/api/health':
                 self._handle_health()
             elif path == '/api/trace':
@@ -216,6 +241,10 @@ class QualityAPIServer:
         self.server = HTTPServer(('127.0.0.1', self.port), QualityAPIHandler)
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
+        if _required_token():
+            logger.info("鉴权已启用：请求需带 X-API-Token / Authorization: Bearer")
+        else:
+            logger.warning("未设置 QA_API_TOKEN：旧版接口无鉴权（仅本机监听）")
         logger.info(f"API服务已启动: http://localhost:{self.port}")
         return f"http://localhost:{self.port}"
     

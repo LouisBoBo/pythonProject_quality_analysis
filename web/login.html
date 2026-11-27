@@ -338,8 +338,11 @@ body {
       const d = await r.json();
       const list = (d && d.enterprises) || ['江西中软电子有限公司'];
       const def = (d && d.default_enterprise) || list[0];
+      const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
       sel.innerHTML = list.map(x => {
-        const v = String(x).replace(/"/g, '&quot;');
+        const v = esc(x);
         return `<option value="${v}">${v}</option>`;
       }).join('');
       sel.value = def;

@@ -8,7 +8,7 @@
 <meta http-equiv="Expires" content="0">
 <meta name="version" content="2026-11-26-8d-evidence-kb">
 <title>PCB智能品质分析系统 v2.0</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script src="/vendor/echarts.min.js"></script>
 <style>
 @keyframes kpiPop { from { transform: scale(.92); opacity: .4; } to { transform: scale(1); opacity: 1; } }
 @keyframes chartGlowPulse {
@@ -399,15 +399,10 @@ input[type=date] { cursor:pointer; }
     <em>v2.0</em>
   </div>
   <div class="top-status">
-    <div class="status-dot" id="erpDot"><div class="dot"></div><span>ERP</span></div>
-    <div class="status-dot" id="mesDot"><div class="dot"></div><span>MES</span></div>
-    <div style="color:var(--text2);font-size:12px;margin-left:8px;" id="topAlertInfo"></div>
-    <div style="color:var(--yellow);font-size:11px;margin-left:8px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="topEnvWarn" title=""></div>
-    <div id="topUserBox" style="display:flex;align-items:center;gap:8px;margin-left:10px;padding-left:10px;border-left:1px solid var(--border);">
+    <div id="topUserBox" style="display:flex;align-items:center;gap:8px;">
       <span style="font-size:12px;color:var(--text2);" id="topUserName">未登录</span>
       <button class="btn btn-ghost" style="font-size:12px;" onclick="logoutQA()">退出</button>
     </div>
-    <button class="btn btn-ghost" style="font-size:12px;" onclick="checkHealth()">🔄 检测连接</button>
   </div>
 </div>
 
@@ -464,56 +459,50 @@ input[type=date] { cursor:pointer; }
 
 <!-- ━━━━━━━━━━━━━━━━━━━━━━ 仪表板 ━━━━━━━━━━━━━━━━━━━━━━ -->
 <div class="page active" id="page-dashboard">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
     <div>
       <h1 style="color:var(--text3);font-size:20px;font-weight:700;">📊 品质总览</h1>
       <p style="color:var(--text2);font-size:13px;margin-top:4px;">
-        领导一眼掌握核心品质数据与指标达成 ·
-        <span id="dashPeriodLabel">当月品质总览</span> |
-        <span id="dashFiscalPeriod" style="color:var(--primary)">202604</span>
+        核心结果 · 异常闭环 ·
+        <span id="dashPeriodLabel">当月</span>
+        <span id="dashFiscalPeriod" style="color:var(--primary);margin-left:6px;">—</span>
       </p>
     </div>
-    <div style="display:flex;gap:10px;align-items:center;">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 10px;" onclick="toggleDashFormulas()" id="btnDashFormula">📐 口径</button>
       <select id="dashPeriod" class="form-input" style="width:120px;" onchange="loadDashboard()">
         <option value="">当月</option>
       </select>
-      <button class="btn btn-primary" onclick="loadDashboard()">🔄 刷新数据</button>
+      <button class="btn btn-primary" onclick="loadDashboard()">🔄 刷新</button>
     </div>
   </div>
 
-  <div id="dashAchieve" class="achieve-board" style="display:none;"></div>
-
-  <div id="dashBriefing" style="display:none;margin-bottom:16px;padding:14px 16px;border:1px solid rgba(88,166,255,.35);border-radius:10px;background:rgba(88,166,255,.07);">
-    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
-      <div style="font-weight:700;color:var(--blue);font-size:14px;">🧭 领导决策简报</div>
-      <div id="dashTargetBadge" style="font-size:12px;"></div>
-    </div>
-    <div id="dashBriefSummary" style="font-size:13px;line-height:1.7;color:var(--text3);"></div>
-    <div id="dashBriefActions" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;"></div>
+  <!-- 兼容占位：旧达成/简报/管理区不再占版面，JS 仍可安全写空 -->
+  <div id="dashAchieve" style="display:none!important;"></div>
+  <div id="dashBriefing" style="display:none!important;">
+    <div id="dashTargetBadge"></div>
+    <div id="dashBriefSummary"></div>
+    <div id="dashBriefActions"></div>
+  </div>
+  <div id="dashBasis" style="display:none!important;"></div>
+  <div id="dashFocus" style="display:none!important;"></div>
+  <div id="dashMgmt" style="display:none!important;">
+    <span id="d_alert_active"></span><span id="d_alert_crit"></span><span id="d_alert_over24"></span>
+    <span id="d_8d_open"></span><span id="d_8d_overdue"></span><span id="d_8d_closed30"></span>
+    <span id="d_ack_rate"></span>
   </div>
 
-  <div style="font-size:12px;color:var(--text2);margin:4px 0 8px;">核心产量与品质结果（FiscalPeriod 实数）· 点击可下钻</div>
-  <div id="dashKpi" class="kpi-grid">
-    <div class="kpi-card green clickable" role="button" tabindex="0" title="查看报废分析" onclick="showPage('scrap')"><div class="kpi-icon">📥</div><div class="kpi-val" id="d_input">—</div><div class="kpi-label">投入PCS</div></div>
-    <div class="kpi-card red clickable" role="button" tabindex="0" title="查看报废分析" onclick="showPage('scrap')"><div class="kpi-icon">❌</div><div class="kpi-val" id="d_reject">—</div><div class="kpi-label">报废PCS</div></div>
-    <div class="kpi-card yellow clickable" role="button" tabindex="0" title="查看报废分析" onclick="showPage('scrap')"><div class="kpi-icon">📉</div><div class="kpi-val" id="d_rate">—%</div><div class="kpi-label">报废率</div><div class="kpi-sub" id="d_rate_sub" style="font-size:11px;color:var(--text2);margin-top:4px;"></div></div>
-    <div class="kpi-card purple clickable" role="button" tabindex="0" title="查看工序过程" onclick="showPage('process')"><div class="kpi-icon">✅</div><div class="kpi-val" id="d_pass">—</div><div class="kpi-label">合格数量</div></div>
-    <div class="kpi-card orange clickable" role="button" tabindex="0" title="查看工序过程" onclick="showPage('process')"><div class="kpi-icon">📈</div><div class="kpi-val" id="d_pass_rate">—%</div><div class="kpi-label">合格率</div><div class="kpi-sub" id="d_pass_sub" style="font-size:11px;color:var(--text2);margin-top:4px;"></div></div>
-  </div>
+  <div id="dashFormulaPanel" style="display:none;margin:0 0 12px;padding:12px 14px;border:1px dashed rgba(88,166,255,.4);border-radius:10px;background:rgba(88,166,255,.06);font-size:12px;line-height:1.7;color:var(--text2);"></div>
 
-  <div id="dashFocus" style="display:none;margin:12px 0 4px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--bg2);"></div>
-
-  <div style="font-size:12px;color:var(--text2);margin:14px 0 8px;">管理闭环与时效（预警 / 8D / 环比）· 点击可下钻</div>
-  <div id="dashMgmt" class="kpi-grid" style="margin-bottom:4px;">
-    <div class="kpi-card red clickable" role="button" tabindex="0" title="查看未确认预警" onclick="showPage('alerts')"><div class="kpi-icon">🚨</div><div class="kpi-val" id="d_alert_active">—</div><div class="kpi-label">未确认预警</div></div>
-    <div class="kpi-card yellow clickable" role="button" tabindex="0" title="查看预警" onclick="showPage('alerts')"><div class="kpi-icon">⚠️</div><div class="kpi-val" id="d_alert_crit">—</div><div class="kpi-label">严重预警</div></div>
-    <div class="kpi-card orange clickable" role="button" tabindex="0" title="查看预警" onclick="showPage('alerts')"><div class="kpi-icon">⏳</div><div class="kpi-val" id="d_alert_over24">—</div><div class="kpi-label">超24h未确认</div></div>
-    <div class="kpi-card blue clickable" role="button" tabindex="0" title="查看8D" onclick="showPage('8d')"><div class="kpi-icon">📋</div><div class="kpi-val" id="d_8d_open">—</div><div class="kpi-label">待关闭8D</div></div>
-    <div class="kpi-card red clickable" role="button" tabindex="0" title="查看8D" onclick="showPage('8d')"><div class="kpi-icon">⏰</div><div class="kpi-val" id="d_8d_overdue">—</div><div class="kpi-label">超期未关8D</div></div>
-    <div class="kpi-card green clickable" role="button" tabindex="0" title="查看8D" onclick="showPage('8d')"><div class="kpi-icon">✅</div><div class="kpi-val" id="d_8d_closed30">—</div><div class="kpi-label">近30天关闭8D</div></div>
-    <div class="kpi-card purple clickable" role="button" tabindex="0" title="查看预警" onclick="showPage('alerts')"><div class="kpi-icon">📊</div><div class="kpi-val" id="d_ack_rate">—</div><div class="kpi-label">预警确认率</div></div>
-    <div class="kpi-card orange clickable" role="button" tabindex="0" title="查看报废" onclick="showPage('scrap')"><div class="kpi-icon">↔️</div><div class="kpi-val" id="d_mom">—</div><div class="kpi-label">报废率环比</div></div>
+  <!-- 核心 KPI（领导必看） -->
+  <div id="dashKpi" class="kpi-grid" style="margin-bottom:12px;">
+    <div class="kpi-card yellow clickable" role="button" tabindex="0" title="报废分析" onclick="showPage('scrap')"><div class="kpi-icon">📉</div><div class="kpi-val" id="d_rate">—%</div><div class="kpi-label">报废率</div><div class="kpi-sub" id="d_rate_sub" style="font-size:11px;color:var(--text2);margin-top:4px;"></div></div>
+    <div class="kpi-card red clickable" role="button" tabindex="0" title="报废分析" onclick="showPage('scrap')"><div class="kpi-icon">❌</div><div class="kpi-val" id="d_reject">—</div><div class="kpi-label">报废PCS</div></div>
+    <div class="kpi-card green clickable" role="button" tabindex="0" title="报废分析" onclick="showPage('scrap')"><div class="kpi-icon">📥</div><div class="kpi-val" id="d_input">—</div><div class="kpi-label">投入PCS</div></div>
+    <div class="kpi-card orange clickable" role="button" tabindex="0" title="工序过程" onclick="showPage('process')"><div class="kpi-icon">📈</div><div class="kpi-val" id="d_pass_rate">—%</div><div class="kpi-label">合格率</div><div class="kpi-sub" id="d_pass_sub" style="font-size:11px;color:var(--text2);margin-top:4px;"></div></div>
+    <div class="kpi-card purple clickable" role="button" tabindex="0" title="相对上月报废率变化（百分点）" onclick="showPage('scrap')"><div class="kpi-icon">↔️</div><div class="kpi-val" id="d_mom">—</div><div class="kpi-label">报废率环比</div><div class="kpi-sub" id="d_mom_sub" style="font-size:11px;color:var(--text2);margin-top:4px;"></div></div>
   </div>
+  <span id="d_pass" style="display:none;"></span>
 
   <div class="dash-hero">
     <div class="card chart-glow">
@@ -521,7 +510,7 @@ input[type=date] { cursor:pointer; }
         <span class="card-title">📈 良率趋势分析</span>
         <div class="seg-tabs" id="yieldTrendTabs">
           <button class="seg-tab active" data-mode="overall" onclick="switchYieldTrend('overall', this)">整体良率</button>
-          <button class="seg-tab" data-mode="process" onclick="switchYieldTrend('process', this)">工序良率</button>
+          <button class="seg-tab" data-mode="process" onclick="switchYieldTrend('process', this)">工序检验通过率</button>
           <button class="seg-tab" data-mode="customer" onclick="switchYieldTrend('customer', this)">客户良率</button>
           <button class="seg-tab" data-mode="metrics" onclick="switchYieldTrend('metrics', this)">关键指标</button>
         </div>
@@ -573,6 +562,48 @@ input[type=date] { cursor:pointer; }
       <div class="card-body"><div id="chartDefectPie" class="chart-box"></div></div>
     </div>
   </div>
+
+  <!-- 闭环 + 决策卡（总览最底部：看完图再闭环） -->
+  <div id="dashClosedLoop" style="display:none;margin-top:16px;margin-bottom:14px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--bg2);">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+      <div style="font-weight:700;font-size:13px;color:var(--text3);">闭环 · 异常料号 → 开 8D → 关闭</div>
+      <div id="dashClosedLoopHint" style="font-size:11px;color:var(--text2);"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;">
+      <button type="button" class="kpi-card yellow clickable" style="margin:0;text-align:left;width:100%;" onclick="openAbnormalPartsPicker()" title="查看 TOP 异常料号并切换决策卡">
+        <div class="kpi-label">异常料号</div>
+        <div class="kpi-val" id="cl_abnormal" style="font-size:20px;">—</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:4px;">点击切换决策卡</div>
+      </button>
+      <button type="button" class="kpi-card blue clickable" style="margin:0;text-align:left;width:100%;" onclick="showPage('8d')">
+        <div class="kpi-label">已开 8D</div>
+        <div class="kpi-val" id="cl_open" style="font-size:20px;">—</div>
+      </button>
+      <button type="button" class="kpi-card green clickable" style="margin:0;text-align:left;width:100%;" onclick="showPage('8d')">
+        <div class="kpi-label">已关闭 8D</div>
+        <div class="kpi-val" id="cl_closed" style="font-size:20px;">—</div>
+      </button>
+      <button type="button" class="kpi-card red clickable" style="margin:0;text-align:left;width:100%;" onclick="showPage('alerts')" title="未确认预警">
+        <div class="kpi-label">未确认预警</div>
+        <div class="kpi-val" id="cl_alerts" style="font-size:20px;">—</div>
+      </button>
+    </div>
+  </div>
+
+  <div id="dashSpotlight" class="card" style="display:none;margin:0 0 8px;">
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span class="card-title">异常料号决策卡</span>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" onclick="shiftSpotlightPart(-1)" title="上一个">‹</button>
+        <select id="spotPartSelect" class="form-input" style="width:min(320px,70vw);font-size:12px;" onchange="onSpotlightPartChange()"></select>
+        <button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 8px;" onclick="shiftSpotlightPart(1)" title="下一个">›</button>
+        <span id="spotPartIdx" style="font-size:11px;color:var(--text2);min-width:48px;"></span>
+        <button type="button" class="btn btn-ghost" style="font-size:12px;" onclick="showPage('trace')">追溯</button>
+        <button type="button" class="btn btn-primary" style="font-size:12px;" id="btnSpot8d" onclick="open8dFromSpotlight()">开 8D</button>
+      </div>
+    </div>
+    <div class="card-body" id="dashSpotlightBody" style="font-size:13px;line-height:1.7;color:var(--text3);"></div>
+  </div>
 </div>
 
 <!-- ━━━━━━━━━━━━━━━━━━━━━━ 品质体检 ━━━━━━━━━━━━━━━━━━━━━━ -->
@@ -590,7 +621,9 @@ input[type=date] { cursor:pointer; }
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">料号（可选，空=全厂当月）</label>
-          <input type="text" id="hPart" placeholder="留空查看全厂，或输入料号如 B60P04L14417A0" style="width:280px;">
+          <select id="hPart" class="form-input" style="width:300px;min-width:220px;">
+            <option value="">全部料号（全厂）</option>
+          </select>
         </div>
         <div class="form-group">
           <label class="form-label">开始日期</label>
@@ -693,7 +726,9 @@ input[type=date] { cursor:pointer; }
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">料号（可选）</label>
-          <input type="text" id="sPart" placeholder="留空=全部" style="width:220px;">
+          <select id="sPart" class="form-input" style="width:260px;min-width:200px;">
+            <option value="">全部料号</option>
+          </select>
         </div>
         <div class="form-group">
           <label class="form-label">开始日期</label>
@@ -721,7 +756,7 @@ input[type=date] { cursor:pointer; }
 <div class="page" id="page-process">
   <h1 style="color:var(--text3);font-size:20px;font-weight:700;margin-bottom:20px;">⚙️ 工序过程分析</h1>
   <div class="card">
-    <div class="card-header"><span class="card-title">MES工序良率（实时）</span>
+    <div class="card-header"><span class="card-title">MES工序检验通过率（实时）</span>
       <span>
         <button class="btn btn-ghost" style="font-size:12px;" onclick="exportExcel('process')">📥 导出Excel</button>
         <button class="btn btn-ghost" style="font-size:12px;" onclick="loadProcess()">🔄 刷新</button>
@@ -776,7 +811,14 @@ input[type=date] { cursor:pointer; }
         </div>
         <div class="form-group">
           <label class="form-label">工序</label>
-          <input type="text" id="ipqcProcess" placeholder="可选，如 阻焊" style="width:140px;">
+          <select id="ipqcProcess" class="form-input" style="width:150px;">
+            <option value="">全部工序</option>
+            <option value="钻孔">钻孔</option>
+            <option value="蚀刻">蚀刻</option>
+            <option value="阻焊">阻焊</option>
+            <option value="成型">成型</option>
+            <option value="待确认工序">待确认工序</option>
+          </select>
         </div>
         <button class="btn btn-primary" onclick="loadIpqc()">🔄 刷新</button>
         <button class="btn btn-secondary" onclick="exportExcel('ipqc')">📥 导出Excel</button>
@@ -825,7 +867,9 @@ input[type=date] { cursor:pointer; }
         </div>
         <div class="form-group">
           <label class="form-label">产品/料号</label>
-          <input type="text" id="copqPart" placeholder="可选" style="width:160px;">
+          <select id="copqPart" class="form-input" style="width:220px;min-width:160px;">
+            <option value="">全部料号</option>
+          </select>
         </div>
         <div class="form-group">
           <label class="form-label">开始日期</label>
@@ -881,7 +925,14 @@ input[type=date] { cursor:pointer; }
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">工序</label>
-          <input type="text" id="spcProcess" placeholder="如 钻孔/阻焊" style="width:160px;">
+          <select id="spcProcess" class="form-input" style="width:150px;">
+            <option value="">全部工序</option>
+            <option value="钻孔">钻孔</option>
+            <option value="蚀刻">蚀刻</option>
+            <option value="阻焊">阻焊</option>
+            <option value="成型">成型</option>
+            <option value="待确认工序">待确认工序</option>
+          </select>
         </div>
         <button class="btn btn-primary" onclick="loadSpc()">🔄 刷新</button>
         <button class="btn btn-secondary" onclick="exportExcel('spc')">📥 导出Excel</button>
@@ -921,8 +972,9 @@ input[type=date] { cursor:pointer; }
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">料号</label>
-          <input type="text" id="tPart" placeholder="如 ASSY-D100" style="width:220px;"
-                 onkeydown="if(event.key==='Enter')runTrace()">
+          <select id="tPart" class="form-input" style="width:260px;min-width:200px;">
+            <option value="">请选择料号…</option>
+          </select>
         </div>
         <div class="form-group">
           <label class="form-label">周期</label>
@@ -941,16 +993,13 @@ input[type=date] { cursor:pointer; }
         <button class="btn btn-primary" onclick="runTrace()" id="btnTrace">▶ 一键追溯</button>
         <button class="btn btn-secondary" onclick="exportReport()">📥 导出报告</button>
       </div>
-      <div id="traceQuickParts" style="margin-top:14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
-        <span style="font-size:12px;color:var(--text2);">快捷料号：</span>
-      </div>
     </div>
   </div>
   <div id="traceResult">
     <div class="card" style="margin-top:16px;">
       <div class="card-body empty">
         <div class="empty-icon">🔍</div>
-        选择上方快捷料号或输入料号后点「一键追溯」，数据来自 ERP + MES
+        从下拉选择料号后点「一键追溯」，数据来自 ERP + MES
       </div>
     </div>
   </div>
@@ -961,7 +1010,7 @@ input[type=date] { cursor:pointer; }
   <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;gap:12px;flex-wrap:wrap;">
     <div>
       <h1 style="color:var(--text3);font-size:20px;font-weight:700;">📋 8D改善报告管理</h1>
-      <p style="color:var(--text2);font-size:13px;margin-top:4px;">D2 指标仅 ERP/MES 实据 · D4/D5 仅引用已关闭历史或待现场填写 · 关闭后回写已验证知识</p>
+      <p style="color:var(--text2);font-size:13px;margin-top:4px;">D2 指标仅 ERP/MES 实据 · D4/D5 只选 GraphRAG / 已关闭·已验证 8D 条目，未命中转待现场确认 · 关闭后回写已验证知识</p>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
       <button class="btn btn-success" onclick="show8DGeneratePanel()">✨ 智能生成</button>
@@ -980,11 +1029,9 @@ input[type=date] { cursor:pointer; }
       <div class="form-row" style="align-items:flex-end;">
         <div class="form-group">
           <label class="form-label">料号（必填）</label>
-          <select id="g8dPartSelect" style="width:320px;min-width:240px;" onchange="onG8dPartChange()">
+          <select id="g8dPartSelect" class="form-input" style="width:320px;min-width:240px;">
             <option value="">请选择料号…</option>
           </select>
-          <input type="text" id="g8dPartCustom" placeholder="输入其他料号"
-                 style="display:none;width:260px;margin-top:6px;">
         </div>
         <div class="form-group" style="flex:1;min-width:280px;">
           <label class="form-label">问题描述（必填）</label>
@@ -1007,7 +1054,7 @@ input[type=date] { cursor:pointer; }
         </div>
         <div id="g8dGenResult" style="display:none;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);font-size:12px;color:var(--text2);line-height:1.6;"></div>
       </div>
-      <p style="color:var(--text2);font-size:12px;margin-top:10px;">下拉为当月 TOP 报废料号（ERP）；选「其他料号…」可手动输入。调用对外接口 <code>POST /api/v1/8d/generate</code>（LangGraph 闭环），返回 D1–D8 后写入本系统供编辑/导出；须现场复核定稿。</p>
+      <p style="color:var(--text2);font-size:12px;margin-top:10px;">料号来自 ERP 工单/报废实据下拉（当月优先）。调用对外接口 <code>POST /api/v1/8d/generate</code>（LangGraph 闭环），返回 D1–D8 后写入本系统供编辑/导出；须现场复核定稿。</p>
     </div>
   </div>
 
@@ -1016,7 +1063,9 @@ input[type=date] { cursor:pointer; }
     <div class="card-header">
       <span class="card-title">8D报告列表</span>
       <div style="display:flex;gap:8px;">
-        <input type="text" id="filter8DPart" placeholder="筛选料号" style="width:160px;" oninput="load8DList()">
+        <select id="filter8DPart" class="form-input" style="width:200px;" onchange="load8DList()">
+          <option value="">全部料号</option>
+        </select>
         <select id="filter8DStatus" onchange="load8DList()">
           <option value="">全部状态</option>
           <option value="open">进行中</option>
@@ -1048,7 +1097,9 @@ input[type=date] { cursor:pointer; }
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px;">
           <div class="form-group">
             <label class="form-label">料号</label>
-            <input type="text" id="e8dPart" style="width:100%;">
+            <select id="e8dPart" class="form-input" style="width:100%;">
+              <option value="">请选择料号…</option>
+            </select>
           </div>
           <div class="form-group">
             <label class="form-label">客户</label>
@@ -1149,8 +1200,9 @@ input[type=date] { cursor:pointer; }
     <div class="card-header">
       <span class="card-title">历史体检报告</span>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <input type="text" id="histPart" placeholder="筛选料号" style="width:140px;"
-               onkeydown="if(event.key==='Enter')loadHistory()">
+        <select id="histPart" class="form-input" style="width:180px;" onchange="loadHistory()">
+          <option value="">全部料号</option>
+        </select>
         <select id="histGrade" onchange="loadHistory()">
           <option value="">全部等级</option>
           <option value="A">A</option><option value="B">B</option>
@@ -1296,6 +1348,8 @@ function setDefaultDates(startId, endId) {
   const end = document.getElementById(endId);
   const start = document.getElementById(startId);
   if (!end || !start) return;  // 跳过不存在的元素
+  // 已有用户选择的日期则保留，避免切页/重载时被重置（筛选项持久化）
+  if (start.value && end.value) return;
   const now = new Date();
   const ymd = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   end.value = ymd(now);
@@ -1330,31 +1384,9 @@ function showPage(name) {
 // ════════════════════════════════════════════════
 async function checkHealth() {
   const r = await api('/api/health');
-  const erpDot = document.getElementById('erpDot');
-  const mesDot = document.getElementById('mesDot');
-  if (r.erp_connected) { erpDot.className = 'status-dot ok'; }
-  else { erpDot.className = 'status-dot err'; }
-  if (r.mes_connected) { mesDot.className = 'status-dot ok'; }
-  else { mesDot.className = 'status-dot err'; }
-  const warnEl = document.getElementById('topEnvWarn');
-  if (warnEl) {
-    const warns = r.warnings || [];
-    if (warns.length) {
-      warnEl.textContent = '⚠ ' + warns[0];
-      warnEl.title = warns.join('\n');
-    } else if (r.using_bridge_fallback) {
-      warnEl.textContent = '⚠ 当前为桥接库数据';
-      warnEl.title = '生产 ERP/MES 仍指向桥接库，请在 .env 配置独立生产库路径';
-    } else {
-      warnEl.textContent = '';
-      warnEl.title = '';
-    }
-  }
-  if (r.connected) toast('数据库连接正常', 'ok');
-  else toast('ERP未连接，请检查工程环境配置', 'err');
-
-  // 更新预警计数
+  // 顶栏连接/桥接提示已下线，仅静默刷新侧栏预警角标
   loadAlertBadge();
+  if (!r.connected) toast('ERP未连接，请检查工程环境配置', 'err');
 }
 
 /** 决策行动文案 → 页面下钻 */
@@ -1366,7 +1398,7 @@ function resolveActionTarget(text) {
   if (/IPQC|检验|待审|积压/.test(t)) return 'ipqc';
   if (/SPC|控制图|Cpk|失控/.test(t)) return 'spc';
   if (/客诉|COPQ|客户/.test(t)) return 'copq';
-  if (/工序|良率|瓶颈|焊接|阻焊/.test(t)) return 'process';
+  if (/工序|良率|瓶颈|钻孔|蚀刻|阻焊|成型|焊接|贴片/.test(t)) return 'process';
   if (/报废|缺陷|帕累托/.test(t)) return 'scrap';
   if (/体检|健康/.test(t)) return 'health';
   return 'alerts';
@@ -1386,7 +1418,7 @@ async function exportExcel(module) {
   const qs = new URLSearchParams({ module });
   try {
     if (module === 'scrap') {
-      const part = (document.getElementById('sPart') || {}).value || '';
+      const part = getPartSelectValue('sPart');
       const start = (document.getElementById('sStart') || {}).value || '';
       const end = (document.getElementById('sEnd') || {}).value || '';
       if (part) qs.set('part', part);
@@ -1400,7 +1432,7 @@ async function exportExcel(module) {
       const process = (document.getElementById('spcProcess') || {}).value || '';
       if (process) qs.set('process', process);
     } else if (module === 'copq') {
-      const part = (document.getElementById('copqPart') || {}).value || '';
+      const part = getPartSelectValue('copqPart');
       const customer = (document.getElementById('copqCustomer') || {}).value || '';
       const start = (document.getElementById('copqStart') || {}).value || '';
       const end = (document.getElementById('copqEnd') || {}).value || '';
@@ -1409,7 +1441,7 @@ async function exportExcel(module) {
       if (start) qs.set('start', start);
       if (end) qs.set('end', end);
     } else if (module === 'health') {
-      const part = (document.getElementById('hPart') || {}).value || '';
+      const part = getPartSelectValue('hPart');
       const start = (document.getElementById('hStart') || {}).value || '';
       const end = (document.getElementById('hEnd') || {}).value || '';
       if (part) qs.set('part', part);
@@ -1435,17 +1467,8 @@ async function exportExcel(module) {
 async function loadAlertBadge() {
   const r = await api('/api/alerts?acknowledged=false');
   if (r.success) {
-    const count = r.total || 0;
-    const badge = document.getElementById('alertBadge');
-    const topInfo = document.getElementById('topAlertInfo');
-    if (count > 0) {
-      badge.style.display = 'inline';
-      badge.textContent = count;
-      topInfo.innerHTML = `<span class="top-alert-badge">⚠️ ${count} 条预警</span>`;
-    } else {
-      badge.style.display = 'none';
-      topInfo.innerHTML = '';
-    }
+    const count = r.active || 0;
+    updateAlertBadge(count);
   }
 }
 
@@ -1474,18 +1497,19 @@ async function loadDashboard() {
     await loadDashPeriods();
   }
 
-  // KPI（数字滚动动画）
+  // KPI（数字滚动动画）：率值直接沿用后端统一口径，rate_reliable=false 时显示「—」避免 100% 伪高
   const k = r.kpi || {};
   const scrapQty = Number(k.total_reject || 0);
   const passQty = Number(k.pass_qty != null ? k.pass_qty : 0);
   // 投入 = 合格 + 报废，避免与合格数量相同造成矛盾
   const inputQty = Number(k.total_input != null ? k.total_input : (passQty + scrapQty));
-  const scrapRate = inputQty > 0
-    ? round2(scrapQty * 100 / inputQty)
-    : Number(k.reject_rate || 0);
-  const passRate = inputQty > 0
-    ? round2(passQty * 100 / inputQty)
-    : Number(k.pass_rate != null ? k.pass_rate : Math.max(0, 100 - scrapRate));
+  const rateReliable = (k.rate_reliable !== false);
+  const scrapRate = rateReliable
+    ? (k.reject_rate != null ? Number(k.reject_rate) : round2(scrapQty * 100 / (inputQty || 1)))
+    : null;
+  const passRate = rateReliable
+    ? (k.pass_rate != null ? Number(k.pass_rate) : round2(passQty * 100 / (inputQty || 1)))
+    : null;
 
   animateKpi('d_input', inputQty);
   animateKpi('d_reject', scrapQty);
@@ -1502,6 +1526,11 @@ async function loadDashboard() {
   const mode = r.ranking_mode || 'scrap_parts';
   const titleEl = document.getElementById('dashRankTitle');
   if (titleEl) titleEl.textContent = '🏆 ' + (r.ranking_title || 'TOP报废料号（当月）');
+
+  // 榜单/工序细口径收入「口径」面板，总览页不再单独铺一条
+  const basisEl = document.getElementById('dashBasis');
+  if (basisEl) basisEl.style.display = 'none';
+  window._dashExtraBasis = [r.ranking_basis, r.process_overview_basis, r.process_overview_unit_gap].filter(Boolean);
   const tp = r.top_defect_parts || [];
   const items = r.top_defect_items || [];
 
@@ -1516,6 +1545,27 @@ async function loadDashboard() {
 
   updateAlertBadge(r.active_alerts || 0);
   renderDashExecutive(r);
+  renderDashClosedLoop(r);
+  renderDashFormulas(r.kpi_formulas || {});
+  window._dashFiscalPeriod = currentPeriod || '';
+  window._dashTopParts = (mode === 'scrap_parts' ? (tp || []) : []).map(p => ({
+    part: p.PartNumber || p.part || '',
+    name: p.PartName || p.part_name || '',
+    scrap: p.TotalReject != null ? p.TotalReject : (p.scrap_pcs || 0),
+    rate: p.RejectRate != null ? p.RejectRate : p.rate,
+  })).filter(p => p.part);
+  fillSpotlightPartSelect(window._dashSpotlightPart || r.spotlight_part || (window._dashTopParts[0] || {}).part || '');
+  const firstPart = (document.getElementById('spotPartSelect') || {}).value
+    || r.spotlight_part
+    || (window._dashTopParts[0] || {}).part
+    || '';
+  window._dashSpotlightPart = firstPart;
+  if (firstPart) {
+    loadPartSpotlight(firstPart, currentPeriod);
+  } else {
+    const spot = document.getElementById('dashSpotlight');
+    if (spot) spot.style.display = 'none';
+  }
 
   window._scrapTrends = r.scrap_trends || null;
   window._scrapTargets = r.targets || {};
@@ -1534,10 +1584,10 @@ async function loadDashboard() {
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       renderDashScrapChart(mode, tp, items);
-      renderDashDefectPie(items.length ? items : tp.map(p => ({
+      renderDashDefectPie(items.length ? items : (mode === 'scrap_parts' ? tp.map(p => ({
         defect_type: p.PartNumber, scrap_pcs: p.TotalReject, ratio: p.RejectRate || 0
-      })));
-      renderDashGauge(window._dashScrapRate || 0);
+      })) : []));
+      renderDashGauge(window._dashScrapRate);
       renderDashYieldGauge(kpiPassRate, avgYield);
       renderYieldTrendChart(yieldMode);
       try {
@@ -1553,60 +1603,238 @@ async function loadDashboard() {
   });
 }
 
+function renderDashClosedLoop(r) {
+  const box = document.getElementById('dashClosedLoop');
+  if (!box) return;
+  const cl = r.closed_loop || {};
+  const ab = cl.abnormal_parts;
+  if (ab == null || (ab === 0 && !cl.has_data && !cl.eight_d_open && !cl.eight_d_closed)) {
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = 'block';
+  const set = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = (v == null ? '—' : Number(v).toLocaleString('zh-CN'));
+  };
+  set('cl_abnormal', cl.abnormal_parts);
+  set('cl_open', cl.eight_d_open);
+  set('cl_closed', cl.eight_d_closed);
+  const mgmt = r.management || {};
+  set('cl_alerts', mgmt.active_alerts != null ? mgmt.active_alerts : (r.active_alerts || 0));
+  const hint = document.getElementById('dashClosedLoopHint');
+  if (hint) {
+    const bits = [];
+    if (cl.parts_without_8d != null) bits.push(`未开单料号 ${cl.parts_without_8d}`);
+    if (mgmt.eight_d_overdue) bits.push(`超期 8D ${mgmt.eight_d_overdue}`);
+    if (mgmt.alert_over_24h) bits.push(`超24h预警 ${mgmt.alert_over_24h}`);
+    hint.textContent = bits.join(' · ') || '仅统计当月有报废的料号';
+  }
+}
+
+function renderDashFormulas(formulas) {
+  window._dashFormulas = formulas || {};
+  const panel = document.getElementById('dashFormulaPanel');
+  if (!panel || panel.style.display === 'none') return;
+  fillDashFormulaPanel();
+}
+
+function fillDashFormulaPanel() {
+  const panel = document.getElementById('dashFormulaPanel');
+  const formulas = window._dashFormulas || {};
+  if (!panel) return;
+  const order = ['scrap_rate', 'scrap_pcs', 'input_pcs', 'pass_qty', 'pass_rate'];
+  const rows = order.map(k => formulas[k]).filter(Boolean);
+  if (!rows.length) {
+    panel.innerHTML = '暂无口径说明（请刷新仪表板）';
+    return;
+  }
+  const extra = (window._dashExtraBasis || []).map(x => `<div>${_esc(x)}</div>`).join('');
+  panel.innerHTML = rows.map(f =>
+    `<div style="margin-bottom:8px;"><b style="color:var(--text3);">${_esc(f.name || '')}</b><br>`
+    + `公式：${_esc(f.formula || '')}<br>`
+    + `<span style="color:var(--text2);">来源：${_esc(f.source || '')}</span></div>`
+  ).join('')
+    + '<div style="color:var(--text2);">无入库基数时报废率/合格率显示「—」，不伪造 100%。</div>'
+    + (extra ? `<div style="margin-top:8px;color:var(--text2);">${extra}</div>` : '');
+}
+
+function toggleDashFormulas() {
+  const panel = document.getElementById('dashFormulaPanel');
+  const btn = document.getElementById('btnDashFormula');
+  if (!panel) return;
+  const open = panel.style.display === 'none' || !panel.style.display;
+  if (open) {
+    fillDashFormulaPanel();
+    panel.style.display = 'block';
+    if (btn) btn.textContent = '📐 收起口径';
+  } else {
+    panel.style.display = 'none';
+    if (btn) btn.textContent = '📐 口径说明';
+  }
+}
+
+function fillSpotlightPartSelect(selected) {
+  const sel = document.getElementById('spotPartSelect');
+  const idxEl = document.getElementById('spotPartIdx');
+  const parts = window._dashTopParts || [];
+  if (!sel) return;
+  if (!parts.length) {
+    sel.innerHTML = '<option value="">暂无 TOP 报废料号</option>';
+    if (idxEl) idxEl.textContent = '';
+    return;
+  }
+  sel.innerHTML = parts.map((p, i) => {
+    const rate = p.rate != null ? ` · ${p.rate}%` : '';
+    const label = `#${i + 1} ${p.part}${p.name && p.name !== p.part ? ' · ' + p.name : ''}（报废 ${Number(p.scrap || 0).toLocaleString('zh-CN')}${rate}）`;
+    return `<option value="${_esc(p.part)}">${_esc(label)}</option>`;
+  }).join('');
+  const cur = selected || parts[0].part;
+  if (![...sel.options].some(o => o.value === cur)) {
+    const opt = document.createElement('option');
+    opt.value = cur;
+    opt.textContent = cur;
+    sel.appendChild(opt);
+  }
+  sel.value = cur;
+  const i = parts.findIndex(p => p.part === cur);
+  if (idxEl) idxEl.textContent = i >= 0 ? `${i + 1}/${parts.length}` : '';
+}
+
+function onSpotlightPartChange() {
+  const sel = document.getElementById('spotPartSelect');
+  const part = sel ? sel.value : '';
+  if (!part) return;
+  window._dashSpotlightPart = part;
+  loadPartSpotlight(part, window._dashFiscalPeriod || '');
+}
+
+function shiftSpotlightPart(delta) {
+  const parts = window._dashTopParts || [];
+  if (!parts.length) { toast('暂无 TOP 异常料号', 'info'); return; }
+  const sel = document.getElementById('spotPartSelect');
+  const cur = (sel && sel.value) || window._dashSpotlightPart || parts[0].part;
+  let i = parts.findIndex(p => p.part === cur);
+  if (i < 0) i = 0;
+  i = (i + delta + parts.length) % parts.length;
+  if (sel) sel.value = parts[i].part;
+  window._dashSpotlightPart = parts[i].part;
+  loadPartSpotlight(parts[i].part, window._dashFiscalPeriod || '');
+}
+
+function openAbnormalPartsPicker() {
+  const parts = window._dashTopParts || [];
+  if (!parts.length) {
+    toast('当月暂无 TOP 报废料号可下钻（168 为全量异常计数，决策卡展示报废 TOP）', 'info');
+    return;
+  }
+  const card = document.getElementById('dashSpotlight');
+  if (card) {
+    card.style.display = 'block';
+    fillSpotlightPartSelect(window._dashSpotlightPart || parts[0].part);
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+  const sel = document.getElementById('spotPartSelect');
+  if (sel) {
+    try { sel.focus(); } catch (e) {}
+  }
+  toast(`共 ${parts.length} 个 TOP 料号可切换（异常总数见闭环格）`, 'info');
+}
+
+function focusDashSpotlightFromLoop() {
+  openAbnormalPartsPicker();
+}
+
+async function loadPartSpotlight(part, fiscalPeriod) {
+  const card = document.getElementById('dashSpotlight');
+  const body = document.getElementById('dashSpotlightBody');
+  if (!card || !body || !part) return;
+  card.style.display = 'block';
+  fillSpotlightPartSelect(part);
+  body.innerHTML = '<div class="loading"><div class="spinner"></div>加载决策卡…</div>';
+  let url = `/api/part_spotlight?part=${encodeURIComponent(part)}`;
+  if (fiscalPeriod) url += `&fiscal_period=${encodeURIComponent(fiscalPeriod)}`;
+  const r = await api(url);
+  if (!r || r.success === false) {
+    body.innerHTML = `<div class="empty">${_esc((r && (r.error || r.data_gap)) || '加载失败')}</div>`;
+    return;
+  }
+  window._spotlightData = r;
+  window._dashSpotlightPart = r.part_number || part;
+  const rateText = r.rate_reliable && r.scrap_rate != null ? `${r.scrap_rate}%` : '—（缺入库，不算率）';
+  const lossText = r.loss_est != null
+    ? `¥${Number(r.loss_est).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}（${_esc(r.loss_label || '已核价')}）`
+    : `待定价${r.unit_price == null ? '（ERP 无单价）' : ''}`;
+  const recColor = r.recommend_8d ? 'var(--red)' : 'var(--text2)';
+  const share = r.plant_scrap_share_pct != null ? `占全厂报废 ${r.plant_scrap_share_pct}%` : '';
+  const openN = (r.open_8d || []).length;
+  const parts = window._dashTopParts || [];
+  const rank = parts.findIndex(p => p.part === (r.part_number || part));
+  body.innerHTML = `
+    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+      <div>
+        <div style="font-size:15px;font-weight:700;color:var(--text3);">${_esc(r.part_number)}${rank >= 0 ? ` <span style="font-size:12px;color:var(--text2);font-weight:500;">TOP ${rank + 1}</span>` : ''}</div>
+        <div style="font-size:12px;color:var(--text2);">${_esc(r.part_name || '—')} · FP ${_esc(r.fiscal_period || '')}</div>
+      </div>
+      <div style="font-size:12px;color:${recColor};font-weight:600;max-width:360px;text-align:right;">${_esc(r.recommend_reason || '')}</div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px;">
+      <div><div style="color:var(--text2);font-size:11px;">报废 PCS</div><div style="font-weight:700;color:var(--red);">${fmt(r.scrap_pcs)}</div></div>
+      <div><div style="color:var(--text2);font-size:11px;">报废率</div><div style="font-weight:700;">${rateText}</div></div>
+      <div><div style="color:var(--text2);font-size:11px;">入库 PCS</div><div style="font-weight:700;">${fmt(r.stock_pcs)}</div></div>
+      <div><div style="color:var(--text2);font-size:11px;">损失估算</div><div style="font-weight:700;">${lossText}</div></div>
+    </div>
+    <div style="font-size:12px;color:var(--text2);">
+      主责工序：<b style="color:var(--text3);">${_esc(r.primary_process || '—')}</b>
+      ${r.primary_process_scrap_pcs != null ? `（${fmt(r.primary_process_scrap_pcs)} PCS）` : ''}
+      · TOP 缺陷：<b style="color:var(--text3);">${_esc(r.top_defect || '—')}</b>
+      ${r.top_defect_scrap_pcs != null ? `（${fmt(r.top_defect_scrap_pcs)} PCS）` : ''}
+      ${share ? ' · ' + share : ''}
+      · 进行中 8D：${openN}
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text2);">${_esc(r.formula || '')}${r.data_gap ? ' · ' + _esc(r.data_gap) : ''}</div>
+  `;
+  const btn = document.getElementById('btnSpot8d');
+  if (btn) {
+    btn.textContent = openN ? '查看/续开 8D' : (r.recommend_8d ? '建议开 8D' : '开 8D');
+  }
+  const idxEl = document.getElementById('spotPartIdx');
+  if (idxEl && parts.length) {
+    idxEl.textContent = rank >= 0 ? `${rank + 1}/${parts.length}` : `—/${parts.length}`;
+  }
+  // 同步追溯页料号，便于一键下钻
+  setPartSelectValue('tPart', r.part_number);
+}
+
+function open8dFromSpotlight() {
+  const r = window._spotlightData;
+  if (!r || !r.part_number) { toast('请先加载决策卡', 'err'); return; }
+  const hint = r.recommend_reason
+    || `品质总览决策卡 · 料号 ${r.part_number} · 报废 ${r.scrap_pcs || 0} PCS`;
+  showPage('8d');
+  show8DGeneratePanel({
+    part: r.part_number,
+    problem_desc: hint,
+    fiscal_period: r.fiscal_period || window._dashFiscalPeriod || '',
+  });
+  const panel = document.getElementById('genPanel');
+  if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 function renderDashExecutive(r) {
   const targets = r.targets || {};
   const mom = r.mom || {};
   const mgmt = r.management || {};
   const vs = r.vs_target || {};
-  const brief = r.decision_briefing || {};
-  const ach = r.achievement || {};
   const scrapTarget = targets.scrap_rate != null ? targets.scrap_rate : 2;
 
-  // 指标达成看板（领导第一眼）
+  // 达成/简报/焦点条已下线，仅保留隐藏节点兼容
   const achBox = document.getElementById('dashAchieve');
-  if (achBox) {
-    const items = ach.items || [];
-    if (!items.length) {
-      achBox.style.display = 'none';
-    } else {
-      const ost = ach.overall_status || 'na';
-      const ocolor = ost === 'ok' ? 'var(--green)' : ost === 'warn' ? 'var(--yellow)' : ost === 'crit' ? 'var(--red)' : 'var(--text2)';
-      achBox.className = 'achieve-board' + (ost === 'ok' ? '' : ' ' + ost);
-      achBox.style.display = 'block';
-      achBox.innerHTML = `
-        <div class="achieve-head">
-          <div>
-            <span style="font-size:13px;color:var(--text2);margin-right:8px;">🎯 指标达成</span>
-            <span class="achieve-verdict" style="color:${ocolor};">${_esc(ach.overall_label || '—')}</span>
-          </div>
-          <div class="achieve-counts">
-            <span style="color:var(--green);">达标 ${ach.ok_count ?? 0}</span> ·
-            <span style="color:var(--yellow);">关注 ${ach.warn_count ?? 0}</span> ·
-            <span style="color:var(--red);">严重 ${ach.crit_count ?? 0}</span>
-          </div>
-        </div>
-        <div class="achieve-grid">
-          ${items.map(it => {
-            const st = it.status || 'na';
-            let valText = '—';
-            if (it.value != null && it.value !== '') {
-              const n = Number(it.value);
-              if (it.unit === 'pp') valText = (n > 0 ? '+' : '') + n + 'pp';
-              else if (it.unit === '%') valText = n + '%';
-              else if (it.unit === '元') valText = '¥' + (Number.isFinite(n) ? n.toLocaleString() : it.value);
-              else if (it.key === 'dppm') valText = Number.isFinite(n) ? Math.round(n).toLocaleString() : String(it.value);
-              else valText = (Number.isFinite(n) ? n.toLocaleString() : it.value) + (it.unit ? ' ' + it.unit : '');
-            }
-            return `<div class="achieve-card ${st}">
-              <div class="achieve-name">${_esc(it.name || '')}</div>
-              <div class="achieve-val">${valText}</div>
-              <div class="achieve-meta">目标 ${_esc(it.target_text || '—')}<br>${_esc(it.hint || '')}</div>
-              <span class="achieve-status ${st}">${_esc(it.status_label || st)}</span>
-            </div>`;
-          }).join('')}
-        </div>`;
-    }
-  }
+  if (achBox) achBox.style.display = 'none';
+  const briefBox = document.getElementById('dashBriefing');
+  if (briefBox) briefBox.style.display = 'none';
+  const focusEl = document.getElementById('dashFocus');
+  if (focusEl) focusEl.style.display = 'none';
 
   const rateSub = document.getElementById('d_rate_sub');
   if (rateSub) {
@@ -1627,84 +1855,36 @@ function renderDashExecutive(r) {
       : `<span style="color:${color}">相对目标 ${d > 0 ? '+' : ''}${d}pp</span> · 目标≥${pt}%`;
   }
 
-  animateKpi('d_alert_active', mgmt.active_alerts != null ? mgmt.active_alerts : r.active_alerts);
-  animateKpi('d_alert_crit', mgmt.critical_alerts || r.critical_alerts || 0);
-  animateKpi('d_alert_over24', mgmt.alert_over_24h || 0);
-  animateKpi('d_8d_open', mgmt.pending_8d != null ? mgmt.pending_8d : r.pending_8d);
-  animateKpi('d_8d_overdue', mgmt.eight_d_overdue || 0);
-  animateKpi('d_8d_closed30', mgmt.closed_8d_30d || 0);
-  const ackEl = document.getElementById('d_ack_rate');
-  if (ackEl) {
-    const bits = [];
-    if (mgmt.alert_ack_rate != null) bits.push(mgmt.alert_ack_rate + '%');
-    if (mgmt.alert_avg_age_hours != null) bits.push('均龄' + mgmt.alert_avg_age_hours + 'h');
-    ackEl.textContent = bits.length ? bits.join(' · ') : '—';
-    ackEl.style.fontSize = bits.length > 1 ? '16px' : '';
-  }
+  // 隐藏兼容节点仍写入，避免其它逻辑读空
+  try {
+    animateKpi('d_alert_active', mgmt.active_alerts != null ? mgmt.active_alerts : r.active_alerts);
+    animateKpi('d_8d_open', mgmt.pending_8d != null ? mgmt.pending_8d : r.pending_8d);
+  } catch (e) {}
+
   const momEl = document.getElementById('d_mom');
+  const momSub = document.getElementById('d_mom_sub');
   if (momEl) {
     const d = mom.scrap_rate_delta;
-    if (d == null) momEl.textContent = '—';
-    else {
+    const prevFp = mom.prev_fiscal_period || '';
+    if (d == null) {
+      momEl.textContent = '—';
+      momEl.style.color = '';
+      if (momSub) {
+        momSub.textContent = mom.note
+          || (prevFp ? `上月 ${prevFp} 缺入库，不计算环比` : '暂无上月可比口径');
+      }
+    } else {
       momEl.textContent = (d > 0 ? '+' : '') + d + 'pp';
       momEl.style.color = d > 0 ? 'var(--red)' : d < 0 ? 'var(--green)' : 'var(--text3)';
+      if (momSub) {
+        const prev = mom.scrap_rate_prev;
+        momSub.textContent = prevFp
+          ? `较 ${prevFp}${prev != null ? `（${prev}%）` : ''}`
+          : '相对上月';
+      }
     }
   }
 
-  // 最弱工序 + 风险客户
-  const focus = ach.focus || brief.focus || {};
-  const focusEl = document.getElementById('dashFocus');
-  if (focusEl) {
-    const wp = focus.weak_process;
-    const rcs = focus.risk_customers || [];
-    if (!wp && !rcs.length) {
-      focusEl.style.display = 'none';
-    } else {
-      focusEl.style.display = 'block';
-      const procName = (wp && wp.process_name) || '';
-      const wpHtml = wp
-        ? `<a href="javascript:void(0)" onclick='drillToProcess(${JSON.stringify(procName)})' style="color:inherit;text-decoration:none;">
-           <span style="color:var(--yellow);font-weight:600;">最弱工序</span>
-           <span style="margin-left:8px;color:var(--text3);">${_esc(procName)} 合格率
-           <strong style="color:var(--red);">${wp.pass_rate != null ? wp.pass_rate + '%' : '—'}</strong></span></a>`
-        : '';
-      const rcHtml = rcs.length
-        ? `<a href="javascript:void(0)" onclick="showPage('copq')" style="color:inherit;text-decoration:none;">
-           <span style="color:var(--orange);font-weight:600;${wp ? 'margin-left:18px;' : ''}">风险客户</span>
-           <span style="margin-left:8px;color:var(--text3);">${rcs.slice(0, 3).map(c => {
-             const name = c.customer_name || c.customer_code || '—';
-             const extra = c.copq != null ? ` ¥${Number(c.copq).toLocaleString()}`
-               : (c.ng_count != null ? ` NG${c.ng_count}` : '');
-             return _esc(name) + extra;
-           }).join(' · ')}</span></a>`
-        : '';
-      const gaps = ((ach.extensions || {}).data_gaps || []).slice(0, 2);
-      const gapHtml = gaps.length
-        ? `<div style="margin-top:6px;font-size:11px;color:var(--text2);">数据缺口：${gaps.map(_esc).join('；')}</div>`
-        : '';
-      focusEl.innerHTML = `<div style="font-size:13px;line-height:1.6;">${wpHtml}${rcHtml}</div>${gapHtml}`;
-    }
-  }
-
-  const box = document.getElementById('dashBriefing');
-  if (!box) return;
-  box.style.display = 'block';
-  const badge = document.getElementById('dashTargetBadge');
-  if (badge) {
-    const ost = ach.overall_status || vs.scrap_status || '';
-    const label = ach.overall_label
-      || (ost === 'ok' ? '整体达标' : ost === 'warn' ? '部分关注' : ost === 'crit' ? '需立即干预' : '—');
-    const color = ost === 'ok' ? 'var(--green)' : ost === 'warn' ? 'var(--yellow)' : 'var(--red)';
-    badge.innerHTML = `<span style="color:${color};font-weight:600;">${_esc(label)}</span>
-      <span style="color:var(--text2);margin-left:8px;">目标报废≤${scrapTarget}% · 合格≥${targets.pass_rate ?? 98}%</span>`;
-  }
-  const sum = document.getElementById('dashBriefSummary');
-  if (sum) sum.textContent = brief.summary || (brief.lines || []).join(' ') || '暂无决策简报';
-  const act = document.getElementById('dashBriefActions');
-  if (act) {
-    const actions = brief.actions || [];
-    act.innerHTML = actions.length ? renderActionTags(actions) : '';
-  }
 }
 
 function switchScrapTrend(mode, btn) {
@@ -1769,9 +1949,9 @@ function renderScrapTrendChart(mode) {
         formatter: (params) => {
           const i = (params[0] && params[0].dataIndex) || 0;
           const row = rows[i] || {};
-          if (!row.has_data) return `${row.label}<br/>本期无报废/入库记录`;
+          if (!row.has_data) return `${_esc(row.label)}<br/>本期无报废/入库记录`;
           const rate = (row.rate_reliable === false || row.scrap_rate == null) ? '—（缺入库）' : (row.scrap_rate + '%');
-          return `${row.label}<br/>报废率: ${rate}<br/>报废: ${fmt(row.scrap_pcs || 0)} PCS<br/>入库: ${fmt(row.stock_pcs || 0)} PCS`;
+          return `${_esc(row.label)}<br/>报废率: ${rate}<br/>报废: ${fmt(row.scrap_pcs || 0)} PCS<br/>入库: ${fmt(row.stock_pcs || 0)} PCS`;
         },
       },
       grid: { left: 56, right: 52, top: 40, bottom: 40 },
@@ -1908,7 +2088,7 @@ function renderScrapTrendChart(mode) {
       formatter: (params) => {
         const i = (params[0] && params[0].dataIndex) || 0;
         const day = days[i] || '';
-        let html = `${day}<br/>`;
+        let html = `${_esc(day)}<br/>`;
         params.forEach(p => {
           const v = p.value;
           const unit = (p.seriesName || '').includes('率') ? '%' : ' PCS';
@@ -1981,7 +2161,8 @@ function renderYieldTrendChart(mode) {
       areaStyle: i === 0 ? { color: 'rgba(88,166,255,.08)' } : undefined,
       animationDuration: 1100, animationDelay: i * 80,
     }));
-    if (hint) hint.textContent = '近30日 · TOP工序日良率（鼠标悬停查看明细）';
+    yName = '检验通过率%';
+    if (hint) hint.textContent = '近30日 · TOP工序日检验通过率（合格检验笔数/检验笔数；鼠标悬停查看明细）';
   } else if (mode === 'customer') {
     const names = t.customer_names || Object.keys(t.customers || {});
     series = names.map((name, i) => ({
@@ -1998,12 +2179,14 @@ function renderYieldTrendChart(mode) {
     series = [
       {
         name: '不良率%', type: 'line', smooth: true, showSymbol: true, symbolSize: 6,
+        connectNulls: false,
         data: (t.metrics || {}).ng_rate || [],
         lineStyle: { width: 3, color: '#f85149' }, itemStyle: { color: '#f85149' },
         areaStyle: { color: 'rgba(248,81,73,.12)' },
       },
       {
         name: '报废率%', type: 'line', smooth: true, showSymbol: true, symbolSize: 6,
+        connectNulls: false,
         data: (t.metrics || {}).scrap_rate || [],
         lineStyle: { width: 3, color: '#d29922' }, itemStyle: { color: '#d29922' },
       },
@@ -2020,7 +2203,9 @@ function renderYieldTrendChart(mode) {
         },
       },
     ];
-    if (hint) hint.textContent = '近30日 · 不良率 / 报废率 / 检验量';
+    const formula = (t.metrics || {}).formula
+      || '不良率=MES检验笔数口径；报废率=ERP报废/(报废+入库)；无入库日不计算报废率';
+    if (hint) hint.textContent = '近30日 · ' + formula;
   } else {
     const overall = t.overall || [];
     const avg = overall.length ? (overall.reduce((a, b) => a + b, 0) / overall.length) : 0;
@@ -2108,8 +2293,8 @@ async function loadDashPeriods() {
   // 保留"当月"选项
   let html = '<option value="">当月</option>';
   periods.forEach(fp => {
-    const label = `${fp.slice(0,4)}-${fp.slice(4,6)}`;
-    html += `<option value="${fp}">${label}</option>`;
+    const label = `${String(fp).slice(0,4)}-${String(fp).slice(4,6)}`;
+    html += `<option value="${_esc(fp)}">${_esc(label)}</option>`;
   });
   periodSel.innerHTML = html;
   periodSel.dataset.loaded = 'true';
@@ -2117,12 +2302,12 @@ async function loadDashPeriods() {
 
 function updateAlertBadge(count) {
   const badge = document.getElementById('alertBadge');
-  const topInfo = document.getElementById('topAlertInfo');
+  if (!badge) return;
   if (count > 0) {
-    badge.style.display = 'inline'; badge.textContent = count;
-    topInfo.innerHTML = `<span class="top-alert-badge">⚠️ ${count} 条预警</span>`;
+    badge.style.display = 'inline';
+    badge.textContent = count;
   } else {
-    badge.style.display = 'none'; topInfo.innerHTML = '';
+    badge.style.display = 'none';
   }
 }
 
@@ -2145,7 +2330,7 @@ async function loadDefaultHealthCheck() {
 
 async function runHealthCheck(opts = {}) {
   const silent = !!opts.silent;
-  const part = document.getElementById('hPart').value.trim();
+  const part = getPartSelectValue('hPart');
   const start = document.getElementById('hStart').value;
   const end = document.getElementById('hEnd').value;
 
@@ -2184,7 +2369,7 @@ async function runHealthCheck(opts = {}) {
     if (loadingEl) {
       loadingEl.style.display = 'block';
       loadingEl.querySelector('.card-body').innerHTML =
-        `⚠️ 体检失败：${r.error || '未知错误'}，请检查 ERP/MES 连接后重试`;
+        `⚠️ 体检失败：${_esc(r.error || '未知错误')}，请检查 ERP/MES 连接后重试`;
     }
     return;
   }
@@ -2263,7 +2448,7 @@ function renderHealthReport(r, part, start, end) {
   if (gaps.length) {
     dimHtml += `<div style="margin-top:8px;padding:8px 10px;border:1px dashed var(--border);border-radius:8px;font-size:11px;color:var(--text2);line-height:1.5;">
       <div style="font-weight:600;margin-bottom:4px;color:var(--yellow);">数据缺口（请在 MES/ERP 补充，系统不编造）</div>
-      ${gaps.map(g => `<div>· ${g}</div>`).join('')}
+      ${gaps.map(g => `<div>· ${_esc(g)}</div>`).join('')}
     </div>`;
   }
   document.getElementById('hrDimScores').innerHTML = dimHtml;
@@ -2299,10 +2484,10 @@ function renderFindings(list, el) {
       <div class="alert-icon" style="color:${lvColor[lv] || 'var(--yellow)'}">${lv === 'critical' ? '🔴' : lv === 'ok' ? '✅' : '🟡'}</div>
       <div class="alert-body">
         <div class="alert-title">
-          <span style="font-size:11px;color:var(--text2);margin-right:8px;">#${i + 1} · ${f.dim || ''} · ${lvTag[lv] || lv}</span>
-          ${f.title || ''}
+          <span style="font-size:11px;color:var(--text2);margin-right:8px;">#${i + 1} · ${_esc(f.dim || '')} · ${_esc(lvTag[lv] || lv)}</span>
+          ${_esc(f.title || '')}
         </div>
-        <div class="alert-suggest">${f.detail || ''}</div>
+        <div class="alert-suggest">${_esc(f.detail || '')}</div>
       </div>
     </div>`;
   });
@@ -2326,8 +2511,8 @@ function renderDefectTable(data, el) {
     const barColor = i < 3 ? 'var(--red)' : 'var(--yellow)';
     html += `<tr>
       <td><span style="color:var(--text2);">${i+1}</span></td>
-      <td class="hl">${d.defect_type || d.DefectType || ''}</td>
-      <td>${d.process || d.Process || '—'}</td>
+      <td class="hl">${_esc(d.defect_type || d.DefectType || '')}</td>
+      <td>${_esc(d.process || d.Process || '—')}</td>
       <td><strong>${fmt(d.scrap_pcs || d.ScrapPcs || 0)}</strong></td>
       <td style="min-width:140px;">
         <div style="display:flex;align-items:center;gap:8px;">
@@ -2345,12 +2530,12 @@ function renderDefectTable(data, el) {
 
 function renderProcessTable(data, el) {
   if (!data.length) { el.innerHTML = '<div class="empty"><div class="empty-icon">⚙️</div>无MES数据</div>'; return; }
-  let html = '<div class="table-wrap"><table><thead><tr><th>工序名称</th><th>检验数量</th><th>合格数量</th><th>不良数量</th><th>良率</th><th>状态</th></tr></thead><tbody>';
+  let html = '<div class="table-wrap"><table><thead><tr><th>工序名称</th><th>检验笔数</th><th>合格笔数</th><th>不良笔数</th><th>检验通过率</th><th>状态</th></tr></thead><tbody>';
   data.forEach(p => {
     const rate = parseFloat(p.PassRate || p.yield_rate || 0);
     const ng = parseInt(p.NgCount || 0);
     html += `<tr>
-      <td class="hl">${p.ProcessName || '—'}</td>
+      <td class="hl">${_esc(p.ProcessName || '—')}</td>
       <td>${fmt(p.InspectCount || p.total_qty || 0)}</td>
       <td>${fmt(p.PassCount || p.pass_qty || 0)}</td>
       <td style="color:var(--red)">${fmt(ng)}</td>
@@ -2367,9 +2552,9 @@ function renderDefectItems(data, el) {
   let html = '<div class="table-wrap"><table><thead><tr><th>工序</th><th>不良项目</th><th>不良描述</th><th>不良数量</th></tr></thead><tbody>';
   data.forEach(d => {
     html += `<tr>
-      <td class="hl">${d.ProcessName || '—'}</td>
-      <td>${d.DefectItem || '—'}</td>
-      <td style="color:var(--text2);font-size:12px;">${d.DefectValue || '—'}</td>
+      <td class="hl">${_esc(d.ProcessName || '—')}</td>
+      <td>${_esc(d.DefectItem || '—')}</td>
+      <td style="color:var(--text2);font-size:12px;">${_esc(d.DefectValue || '—')}</td>
       <td><strong style="color:var(--red)">${fmt(d.DefectCount || 0)}</strong></td>
     </tr>`;
   });
@@ -2381,13 +2566,14 @@ function renderRecommendations(recs, el) {
   if (!recs.length) { el.innerHTML = '<div class="empty"><div class="empty-icon">✅</div>品质良好，暂无改善建议</div>'; return; }
   let html = '';
   recs.forEach(r => {
-    const pc = `rec-p${r.priority?.replace('P','').toLowerCase() || '3'}`;
+    const prio = String(r.priority || 'P3').replace(/[^Pp0-9]/g, '');
+    const pc = `rec-p${prio.replace('P','').toLowerCase() || '3'}`;
     html += `<div class="rec-card">
-      <div class="rec-priority ${pc}">${r.priority || 'P3'}</div>
+      <div class="rec-priority ${pc}">${_esc(prio || 'P3')}</div>
       <div class="rec-content">
-        <div class="rec-title">【${r.type||''}】${r.title||''}</div>
-        <div class="rec-action">▶ ${r.action||''}</div>
-        <div class="rec-meta">责任人：${r.owner||'—'} | 完成期限：${r.deadline||'—'}</div>
+        <div class="rec-title">【${_esc(r.type||'')}】${_esc(r.title||'')}</div>
+        <div class="rec-action">▶ ${_esc(r.action||'')}</div>
+        <div class="rec-meta">责任人：${_esc(r.owner||'—')} | 完成期限：${_esc(r.deadline||'—')}</div>
       </div>
     </div>`;
   });
@@ -2404,7 +2590,7 @@ function renderHealthAlerts(alerts, el, count) {
     html += `<div class="alert-card ${a.level || 'warning'}">
       <div class="alert-icon">${a.level === 'critical' ? '🔴' : '🟡'}</div>
       <div class="alert-body">
-        <div class="alert-title">${a.message || ''}</div>
+        <div class="alert-title">${_esc(a.message || '')}</div>
         <div class="alert-suggest">进入【智能预警】查看处理建议</div>
       </div>
     </div>`;
@@ -2427,7 +2613,7 @@ async function runScrap(opts = {}) {
   if (_scrapLoading) return;
   _scrapLoading = true;
   const silent = !!opts.silent;
-  const part = document.getElementById('sPart').value.trim();
+  const part = getPartSelectValue('sPart');
   const start = document.getElementById('sStart').value;
   const end = document.getElementById('sEnd').value;
   const btn = document.getElementById('btnScrap');
@@ -2452,7 +2638,7 @@ async function runScrap(opts = {}) {
   if (btn) { btn.disabled = false; btn.textContent = '🔍 查询分析'; }
 
   if (!r.success) {
-    el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>查询失败: ${r.error||'未知错误'}</div>`;
+    el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>查询失败: ${_esc(r.error||'未知错误')}</div>`;
     return;
   }
   _scrapLoaded = true;
@@ -2461,7 +2647,7 @@ async function runScrap(opts = {}) {
   const inputBase = (r.total_scrap_pcs || 0) + (r.total_in_stock_pcs || 0);
   el.innerHTML = `
     <div style="color:var(--text2);font-size:12px;margin:12px 0 8px;">
-      范围：${scope} · ${start || '不限'} ~ ${end || '不限'} · 口径：报废÷(报废+入库)
+      范围：${_esc(scope)} · ${_esc(start || '不限')} ~ ${_esc(end || '不限')} · 口径：报废÷(报废+入库)
     </div>
     <div class="kpi-grid" style="margin-bottom:20px;">
       <div class="kpi-card red"><div class="kpi-icon">❌</div><div class="kpi-val">${fmt(r.total_scrap_pcs)}</div><div class="kpi-label">报废PCS</div></div>
@@ -2538,7 +2724,7 @@ function renderScrapProcessChart(rows) {
       const pct = (d.ratio || (d.value * 100 / total)).toFixed(1);
       const barW = Math.max(8, Math.round(d.value / restMax * 100));
       return `<div style="display:grid;grid-template-columns:72px 1fr 100px;gap:12px;align-items:center;padding:10px 0;">
-        <div style="font-size:13px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${d.name}">${d.name}</div>
+        <div style="font-size:13px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${_esc(d.name)}">${_esc(d.name)}</div>
         <div style="height:12px;background:var(--bg4);border-radius:999px;overflow:hidden;">
           <div style="width:${barW}%;height:100%;border-radius:999px;background:linear-gradient(90deg,#1f6feb,#58a6ff);"></div>
         </div>
@@ -2563,7 +2749,7 @@ function renderScrapProcessChart(rows) {
       <div style="flex:1.4;padding:14px 16px;border-radius:12px;background:linear-gradient(135deg,rgba(248,81,73,.18),rgba(248,81,73,.05));border:1px solid rgba(248,81,73,.35);">
         <div style="font-size:11px;color:#ff7b72;letter-spacing:.04em;">主导工序</div>
         <div style="display:flex;align-items:baseline;gap:10px;margin-top:6px;">
-          <div style="font-size:22px;font-weight:700;color:var(--text3);">${top.name}</div>
+          <div style="font-size:22px;font-weight:700;color:var(--text3);">${_esc(top.name)}</div>
           <div style="font-size:28px;font-weight:700;color:#ff7b72;">${topPct}%</div>
         </div>
         <div style="margin-top:4px;font-size:12px;color:var(--text2);">报废 ${fmt(top.value)} PCS</div>
@@ -2608,7 +2794,7 @@ function renderScrapDailyTrendChart(rows) {
       formatter: params => {
         const i = params[0]?.dataIndex ?? 0;
         const full = data[i]?.Day || data[i]?.Month || days[i];
-        let html = `${full}<br/>`;
+        let html = `${_esc(full)}<br/>`;
         params.forEach(p => {
           const v = p.seriesName.includes('率') ? `${p.value}%` : fmt(p.value);
           html += `${p.marker}${p.seriesName}: ${v}<br/>`;
@@ -2695,8 +2881,16 @@ async function loadIpqc() {
     if (bl.pending_over_24h_ratio != null) bits.push(`待审超24h ${bl.pending_over_24h_ratio}%`);
     if (bl.audit_timing_reliable && bl.avg_audit_hours != null) bits.push(`已审均时 ${bl.avg_audit_hours}h`);
     else if ((bl.notes || []).length) bits.push('已审时效暂不可用');
+    const types = r.by_inspect_type || [];
+    if (types.length) {
+      bits.push('类型：' + types.map(t => `${t.label} ${fmt(t.total)}单/${t.ng_count}NG`).join('，'));
+    }
     hint.textContent = bits.join(' · ');
-    hint.title = (bl.notes || []).join('；');
+    const tip = [];
+    if (bl.pending_scope) tip.push(bl.pending_scope);
+    if (r.inspect_type_note) tip.push(r.inspect_type_note);
+    tip.push(...(bl.notes || []));
+    hint.title = tip.join('；');
   }
 
   // KPI/决策区撑开后再绘四图，避免 0 尺寸绘制 + 立刻 resize 掐掉入场动画
@@ -2790,7 +2984,7 @@ async function loadIpqc() {
               formatter: params => {
                 const i = params[0].dataIndex;
                 const row = cust[i];
-                return `${row.customer_name || row.customer_code}<br/>不合格: ${fmt(row.ng_count)}<br/>不合格率: ${row.ng_rate}%`;
+                return `${_esc(row.customer_name || row.customer_code)}<br/>不合格: ${fmt(row.ng_count)}<br/>不合格率: ${row.ng_rate}%`;
               },
             },
             grid: { left: 88, right: 40, top: 16, bottom: 24 },
@@ -2863,7 +3057,7 @@ async function loadIpqc() {
 
 async function loadCopq() {
   const customer = (document.getElementById('copqCustomer') || {}).value || '';
-  const part = (document.getElementById('copqPart') || {}).value || '';
+  const part = getPartSelectValue('copqPart');
   const start = (document.getElementById('copqStart') || {}).value || '';
   const end = (document.getElementById('copqEnd') || {}).value || '';
   const qs = new URLSearchParams();
@@ -2924,7 +3118,7 @@ async function loadCopq() {
     } else {
       chartC.setOption({
         ...ECHART_DARK,
-        tooltip: { trigger: 'item', formatter: p => `${p.name}<br/>${_money(p.value)}（${p.percent}%）` },
+        tooltip: { trigger: 'item', formatter: p => `${_esc(p.name)}<br/>${_money(p.value)}（${p.percent}%）` },
         series: [{
           type: 'pie', radius: ['40%', '70%'], roseType: false,
           data: cat.map((x, i) => ({
@@ -2989,6 +3183,14 @@ async function loadCopq() {
   }
 }
 
+function _spcStatusMeta(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'alert') return { label: '告警', color: 'var(--red)' };
+  if (s === 'insufficient') return { label: '样本不足', color: 'var(--yellow)' };
+  if (s === 'na' || s === 'unknown') return { label: '待验证', color: 'var(--text2)' };
+  return { label: '正常', color: 'var(--green)' };
+}
+
 async function loadSpc(selectedId) {
   const process = (document.getElementById('spcProcess') || {}).value || '';
   const qs = new URLSearchParams();
@@ -3002,11 +3204,15 @@ async function loadSpc(selectedId) {
   }
   const s = r.summary || {};
   if (kpiEl) {
+    const extra = [];
+    if (s.insufficient) extra.push(`<div class="kpi-card yellow"><div class="kpi-icon">⏳</div><div class="kpi-val">${fmt(s.insufficient)}</div><div class="kpi-label">样本不足</div></div>`);
+    if (s.unverified) extra.push(`<div class="kpi-card"><div class="kpi-icon">❔</div><div class="kpi-val">${fmt(s.unverified)}</div><div class="kpi-label">无测值(沿用ERP)</div></div>`);
     kpiEl.innerHTML = `
       <div class="kpi-card blue"><div class="kpi-icon">📐</div><div class="kpi-val">${fmt(s.total)}</div><div class="kpi-label">控制图数</div></div>
       <div class="kpi-card red"><div class="kpi-icon">🚨</div><div class="kpi-val">${fmt(s.alert)}</div><div class="kpi-label">告警图</div></div>
       <div class="kpi-card green"><div class="kpi-icon">✅</div><div class="kpi-val">${fmt(s.normal)}</div><div class="kpi-label">正常图</div></div>
-      <div class="kpi-card purple"><div class="kpi-icon">Cpk</div><div class="kpi-val">${s.avg_cpk != null ? s.avg_cpk : '—'}</div><div class="kpi-label">平均 Cpk</div></div>`;
+      <div class="kpi-card purple"><div class="kpi-icon">Cpk</div><div class="kpi-val">${s.avg_cpk != null ? s.avg_cpk : '—'}</div><div class="kpi-label">平均 Cpk</div></div>
+      ${extra.join('')}`;
   }
 
   const listEl = document.getElementById('spcList');
@@ -3017,13 +3223,13 @@ async function loadSpc(selectedId) {
     listEl.innerHTML = charts.length
       ? charts.map(c => {
           const on = Number(c.id) === Number(activeId);
-          const alert = String(c.status || '').toLowerCase() === 'alert';
+          const sm = _spcStatusMeta(c.status);
           return `<div onclick="loadSpc(${c.id})" style="padding:10px 12px;border-radius:10px;cursor:pointer;margin-bottom:8px;
             border:1px solid ${on ? 'rgba(88,166,255,.55)' : 'var(--border)'};
             background:${on ? 'rgba(88,166,255,.12)' : 'transparent'};">
             <div style="display:flex;justify-content:space-between;gap:8px;">
               <strong style="color:var(--text3);">${_esc(c.chart_name || c.chart_code)}</strong>
-              <span style="color:${alert ? 'var(--red)' : 'var(--green)'};font-size:12px;">${alert ? '告警' : '正常'}</span>
+              <span style="color:${sm.color};font-size:12px;">${sm.label}</span>
             </div>
             <div style="font-size:12px;color:var(--text2);margin-top:4px;">
               ${_esc(c.process_name || '')} · ${_esc(c.characteristic || '')} · ${_esc(c.chart_type || '')}
@@ -3090,7 +3296,7 @@ async function loadSpc(selectedId) {
           const i = p.dataIndex;
           const pt = pts[i] || {};
           const bad = pt.out_of_control ? '<br/><span style="color:#f85149">失控点</span>' : '';
-          return `#${xs[i]}<br/>测值: ${p.value}${detail.unit ? ' ' + detail.unit : ''}${bad}`;
+          return `#${xs[i]}<br/>测值: ${p.value}${detail.unit ? ' ' + _esc(detail.unit) : ''}${bad}`;
         },
       },
       grid: { left: 56, right: 24, top: 28, bottom: 36 },
@@ -3126,7 +3332,10 @@ async function loadProcess() {
   if (!r.success) { el.innerHTML = '<div class="empty">MES未连接</div>'; return; }
   const yields = r.process_yield || [];
   el.innerHTML = `<div id="chartProcessPage" class="chart-box chart-glow" style="height:360px;min-height:360px;"></div>
+    <div id="processBasis" style="font-size:12px;color:var(--text2);margin-top:6px;"></div>
     <div id="processTableWrap" style="margin-top:12px;"></div>`;
+  const basisEl = document.getElementById('processBasis');
+  if (basisEl) basisEl.textContent = r.rate_basis ? `口径：${r.rate_basis}` : '';
   renderProcessTable(yields, document.getElementById('processTableWrap') || el);
   renderDefectItems(r.process_defects || [], el2);
 
@@ -3149,7 +3358,7 @@ async function loadProcess() {
         ...ECHART_DARK,
         animationDuration: 1400,
         tooltip: { trigger: 'axis' },
-        legend: { data: ['良率%', '检验数'], textStyle: { color: '#8b949e' }, top: 0 },
+        legend: { data: ['检验通过率%', '检验笔数'], textStyle: { color: '#8b949e' }, top: 0 },
         grid: { left: 60, right: 50, top: 40, bottom: 50 },
         xAxis: {
           type: 'category',
@@ -3159,19 +3368,19 @@ async function loadProcess() {
         },
         yAxis: [
           {
-            type: 'value', name: '良率%', max: 100,
+            type: 'value', name: '检验通过率%', max: 100,
             axisLabel: { color: '#8b949e', formatter: '{value}%' },
             splitLine: { lineStyle: { color: '#30363d', type: 'dashed' } },
           },
           {
-            type: 'value', name: '检验数',
+            type: 'value', name: '检验笔数',
             axisLabel: { color: '#8b949e' },
             splitLine: { show: false },
           },
         ],
         series: [
           {
-            name: '良率%', type: 'bar', barMaxWidth: 28,
+            name: '检验通过率%', type: 'bar', barMaxWidth: 28,
             data: data.map((d, i) => {
               const v = parseFloat(d.PassRate || d.yield_rate || 0);
               const c0 = v >= 98 ? '#56d364' : v >= 90 ? '#d29922' : '#ff7b72';
@@ -3196,7 +3405,7 @@ async function loadProcess() {
             },
           },
           {
-            name: '检验数', type: 'line', yAxisIndex: 1,
+            name: '检验笔数', type: 'line', yAxisIndex: 1,
             data: data.map(d => d.InspectCount || d.total_qty || 0),
             smooth: true, showSymbol: true, symbol: 'circle', symbolSize: 8,
             lineStyle: { width: 3.5, color: '#3fb950', shadowBlur: 10, shadowColor: 'rgba(63,185,80,.45)' },
@@ -3214,53 +3423,25 @@ async function loadProcess() {
 // ════════════════════════════════════════════════
 // 产品追溯
 // ════════════════════════════════════════════════
-let _traceQuickLoaded = false;
 let _traceMrbTrendData = [];
 
 async function loadTracePage() {
   setDefaultDates('tStart', 'tEnd');
-  await loadTraceQuickParts();
-}
-
-async function loadTraceQuickParts() {
-  const box = document.getElementById('traceQuickParts');
-  if (!box) return;
-  const r = await api('/api/dashboard');
-  const parts = (r.top_defect_parts || []).slice(0, 6);
-  let html = '<span style="font-size:12px;color:var(--text2);">快捷料号：</span>';
-  if (!parts.length) {
-    html += '<span style="font-size:12px;color:var(--text2);">暂无推荐，请手动输入</span>';
-    box.innerHTML = html;
-  } else {
-    parts.forEach(p => {
-      const code = p.PartNumber || p.part || p.MfgPartCode || '';
-      if (!code) return;
-      const safe = String(code).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-      html += `<button type="button" class="btn btn-ghost" style="font-size:12px;padding:4px 10px;" data-part="${safe}">${safe}</button>`;
-    });
-    box.innerHTML = html;
-    box.querySelectorAll('button[data-part]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.getElementById('tPart').value = btn.getAttribute('data-part') || '';
-        runTrace();
-      });
-    });
-  }
-  _traceQuickLoaded = true;
+  await fillPartSelects(['tPart']);
 }
 
 async function runTrace() {
-  const part = document.getElementById('tPart').value.trim();
+  const part = getPartSelectValue('tPart');
   const start = document.getElementById('tStart').value;
   const end = document.getElementById('tEnd').value;
   const period = document.getElementById('tPeriod').value;
-  if (!part) { toast('请输入料号', 'err'); return; }
+  if (!part) { toast('请选择料号', 'err'); return; }
 
   const btn = document.getElementById('btnTrace');
   const el = document.getElementById('traceResult');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 追溯中...'; }
   el.innerHTML = `<div class="card"><div class="card-body" style="text-align:center;padding:40px;color:var(--text2);">
-    ⏳ 正在从 ERP / MES 拉取 ${part} 追溯数据…
+    ⏳ 正在从 ERP / MES 拉取 ${_esc(part)} 追溯数据…
   </div></div>`;
 
   await loadPeriods('t', part);
@@ -3277,7 +3458,7 @@ async function runTrace() {
   const r = await api(url);
   if (btn) { btn.disabled = false; btn.textContent = '▶ 一键追溯'; }
   if (!r.success) {
-    el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>查询失败: ${r.error||''}</div>`;
+    el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>查询失败: ${_esc(r.error||'')}</div>`;
     return;
   }
 
@@ -3286,8 +3467,8 @@ async function runTrace() {
   const mrb = r.mrb || {};
   el.innerHTML = `
     <div style="color:var(--text2);font-size:12px;margin:4px 0 12px;">
-      料号 <b style="color:var(--text3)">${r.part_number || part}</b>
-      · ${r.date_range || (start + ' ~ ' + end)}
+      料号 <b style="color:var(--text3)">${_esc(r.part_number || part)}</b>
+      · ${_esc(r.date_range || (start + ' ~ ' + end))}
       · MES 匹配工单 ${fmt(mes.wo_matched || 0)} · 检验履历 ${fmt(mes.inspect_count || 0)} 条
     </div>
     <div class="kpi-grid" style="margin-bottom:20px;">
@@ -3321,13 +3502,13 @@ async function runTrace() {
     woHtml = '<div class="table-wrap"><table><thead><tr><th>工单号</th><th>料号</th><th>产出PCS</th><th>工单报废</th><th>状态</th><th>开工</th><th>完工</th></tr></thead><tbody>';
     wos.forEach(w => {
       woHtml += `<tr>
-        <td class="hl">${w.woNumber||''}</td>
-        <td>${w.PartNumber||''}</td>
+        <td class="hl">${_esc(w.woNumber||'')}</td>
+        <td>${_esc(w.PartNumber||'')}</td>
         <td>${fmt(w.PcsProduced)}</td>
         <td style="color:var(--red)">${fmt(w.RejectPcs)}</td>
-        <td>${w.status||'—'}</td>
-        <td>${String(w.createDate||'').substring(0,10)}</td>
-        <td>${String(w.endDate||'').substring(0,10)||'—'}</td>
+        <td>${_esc(w.status||'—')}</td>
+        <td>${_esc(String(w.createDate||'').substring(0,10))}</td>
+        <td>${_esc(String(w.endDate||'').substring(0,10)||'—')}</td>
       </tr>`;
     });
     woHtml += '</tbody></table></div>';
@@ -3373,12 +3554,12 @@ async function runTrace() {
     records.forEach(row => {
       const ok = Number(row.ResultCode) === 1;
       ih += `<tr>
-        <td>${String(row.InspectTime || '').replace('T', ' ').substring(0, 19)}</td>
-        <td>${row.InspectCode || '—'}</td>
-        <td class="hl">${row.WoNumber || '—'}</td>
-        <td>${row.Barcode || '—'}</td>
-        <td>${row.ProcessName || '—'}</td>
-        <td style="color:${ok ? 'var(--green)' : 'var(--red)'}">${row.ResultName || (ok ? '合格' : '不合格')}</td>
+        <td>${_esc(String(row.InspectTime || '').replace('T', ' ').substring(0, 19))}</td>
+        <td>${_esc(row.InspectCode || '—')}</td>
+        <td class="hl">${_esc(row.WoNumber || '—')}</td>
+        <td>${_esc(row.Barcode || '—')}</td>
+        <td>${_esc(row.ProcessName || '—')}</td>
+        <td style="color:${ok ? 'var(--green)' : 'var(--red)'}">${_esc(row.ResultName || (ok ? '合格' : '不合格'))}</td>
         <td>${fmt(row.InspectQty)}</td>
       </tr>`;
     });
@@ -3462,12 +3643,12 @@ function onPeriodChange(prefix) {
 
 // 导出报告
 async function exportReport() {
-  const part = document.getElementById('tPart').value.trim();
+  const part = getPartSelectValue('tPart');
   const start = document.getElementById('tStart').value;
   const end = document.getElementById('tEnd').value;
   const period = document.getElementById('tPeriod').value;
 
-  if (!part) { toast('请输入料号', 'err'); return; }
+  if (!part) { toast('请选择料号', 'err'); return; }
 
   toast('正在生成PDF报告...', 'info');
 
@@ -3504,8 +3685,8 @@ async function loadPeriods(prefix, part) {
     periodEl.innerHTML = '<option value="">全部/自定义</option>';
     periods.forEach(p => {
       // 转换YYYYMM为YYYY-MM格式显示
-      const display = p.length === 6 ? p.slice(0,4) + '-' + p.slice(4,6) : p;
-      periodEl.innerHTML += `<option value="${display}">${display}</option>`;
+      const display = String(p).length === 6 ? String(p).slice(0,4) + '-' + String(p).slice(4,6) : String(p);
+      periodEl.innerHTML += `<option value="${_esc(display)}">${_esc(display)}</option>`;
     });
   }
 }
@@ -3602,7 +3783,7 @@ const D_NAMES = ['成立团队', '问题描述', '临时措施', '根本原因�
 const D_COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#f97316','#a371f7','#39d353','#79c0ff'];
 
 async function load8DList() {
-  const part = document.getElementById('filter8DPart').value.trim();
+  const part = getPartSelectValue('filter8DPart');
   const status = document.getElementById('filter8DStatus').value;
   let url = '/api/8d/list?';
   if (part) url += `part=${encodeURIComponent(part)}&`;
@@ -3630,18 +3811,18 @@ async function load8DList() {
       histN ? `历史${histN}` : '',
       kbN ? `知识库${kbN}` : ''
     ].filter(Boolean).join(' · ') || '待填';
-    const idSafe = String(rp.id || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const idJson = _esc(JSON.stringify(String(rp.id || '')));
     html += `<tr>
-      <td class="hl">${rp.report_no||rp.id}</td>
-      <td>${rp.part_number||'—'}</td>
-      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(rp.problem||'').replace(/"/g,'&quot;')}">${rp.problem||'—'}</td>
+      <td class="hl">${_esc(rp.report_no||rp.id)}</td>
+      <td>${_esc(rp.part_number||'—')}</td>
+      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${_esc(rp.problem||'')}">${_esc(rp.problem||'—')}</td>
       <td><span style="color:${svColor};font-weight:700;">${'★'.repeat(sv)}</span></td>
-      <td style="font-size:12px;color:var(--text2);">${basis}</td>
+      <td style="font-size:12px;color:var(--text2);">${_esc(basis)}</td>
       <td>${st}</td>
-      <td style="font-size:12px;color:var(--text2);">${String(rp.created_at||'').replace('T',' ').substring(0,16)}</td>
+      <td style="font-size:12px;color:var(--text2);">${_esc(String(rp.created_at||'').replace('T',' ').substring(0,16))}</td>
       <td style="white-space:nowrap;">
-        <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;" onclick="open8D('${idSafe}')">打开</button>
-        <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;" onclick="export8D('${idSafe}')">导出</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;" onclick="open8D(${idJson})">打开</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;" onclick="export8D(${idJson})">导出</button>
       </td>
     </tr>`;
   });
@@ -3671,8 +3852,16 @@ async function export8D(id) {
 
 let _g8dGenTimer = null;
 let _g8dGenPhaseTimer = null;
+let _g8dGenPollTimer = null;
 let _g8dGenBusy = false;
 let _g8dGenStartedAt = 0;
+// 预警转 8D 的来源关联：{alert_id, fiscal_period, part, problem}
+let _g8dAlertCtx = null;
+let _g8dGenJobId = null;
+let _g8dGenPollFails = 0;
+let _g8dGenTimerSynced = false;
+let _g8dGenRemote = false;
+const G8D_JOB_STORAGE_KEY = 'g8d_job_id';
 
 const G8D_PHASES = [
   { t: 0,  title: '提交请求…', detail: '正在调用对外 8D 接口' },
@@ -3696,20 +3885,33 @@ function _setG8dGenControls(busy) {
   _g8dGenBusy = !!busy;
   const btn = document.getElementById('g8dGenBtn');
   const sel = document.getElementById('g8dPartSelect');
-  const custom = document.getElementById('g8dPartCustom');
   const problem = document.getElementById('g8dProblem');
   if (btn) {
     btn.disabled = !!busy;
     btn.textContent = busy ? '生成中…' : '生成';
   }
   if (sel) sel.disabled = !!busy;
-  if (custom) custom.disabled = !!busy;
   if (problem) problem.disabled = !!busy;
 }
 
 function _stopG8dGenTimers() {
   if (_g8dGenTimer) { clearInterval(_g8dGenTimer); _g8dGenTimer = null; }
   if (_g8dGenPhaseTimer) { clearInterval(_g8dGenPhaseTimer); _g8dGenPhaseTimer = null; }
+}
+
+function _stopG8dGenPolling() {
+  if (_g8dGenPollTimer) { clearTimeout(_g8dGenPollTimer); _g8dGenPollTimer = null; }
+}
+
+function _rememberG8dJob(jobId) {
+  try {
+    if (jobId) sessionStorage.setItem(G8D_JOB_STORAGE_KEY, jobId);
+    else sessionStorage.removeItem(G8D_JOB_STORAGE_KEY);
+  } catch (e) {}
+}
+
+function _recalledG8dJob() {
+  try { return sessionStorage.getItem(G8D_JOB_STORAGE_KEY) || ''; } catch (e) { return ''; }
 }
 
 function _updateG8dGenPhase(elapsedSec) {
@@ -3724,13 +3926,17 @@ function _updateG8dGenPhase(elapsedSec) {
   if (detailEl) detailEl.textContent = cur.detail;
 }
 
-function _startG8dGenStatus() {
+function _startG8dGenStatus(remote) {
   const box = document.getElementById('g8dGenStatus');
   const timerEl = document.getElementById('g8dGenTimer');
   const spinner = document.getElementById('g8dGenSpinner');
+  const phaseEl = document.getElementById('g8dGenPhase');
+  const detailEl = document.getElementById('g8dGenDetail');
   const resultEl = document.getElementById('g8dGenResult');
   if (!box) return;
   _stopG8dGenTimers();
+  _g8dGenRemote = !!remote;
+  _g8dGenTimerSynced = false;
   _g8dGenStartedAt = performance.now();
   box.style.display = 'block';
   box.style.borderColor = 'rgba(88,166,255,.35)';
@@ -3738,16 +3944,43 @@ function _startG8dGenStatus() {
   if (spinner) spinner.style.display = 'block';
   if (resultEl) { resultEl.style.display = 'none'; resultEl.innerHTML = ''; }
   if (timerEl) timerEl.textContent = '0.0s';
-  _updateG8dGenPhase(0);
+  if (_g8dGenRemote) {
+    if (phaseEl) phaseEl.textContent = '已提交，等待任务状态…';
+    if (detailEl) detailEl.textContent = '任务在后台运行，可切换页面，稍后回来查看';
+  } else {
+    _updateG8dGenPhase(0);
+  }
   _g8dGenTimer = setInterval(() => {
     const sec = (performance.now() - _g8dGenStartedAt) / 1000;
     if (timerEl) timerEl.textContent = _fmtElapsed(sec);
-    _updateG8dGenPhase(sec);
+    if (!_g8dGenRemote) _updateG8dGenPhase(sec);
   }, 200);
+}
+
+// 用服务端任务快照刷新阶段文案；本地计时保持连续，首次用服务端 elapsed 校准
+function _applyG8dJob(job) {
+  const phaseEl = document.getElementById('g8dGenPhase');
+  const detailEl = document.getElementById('g8dGenDetail');
+  if (!job) return;
+  if (!_g8dGenTimerSynced && job.elapsed_s != null) {
+    _g8dGenStartedAt = performance.now() - (Number(job.elapsed_s) || 0) * 1000;
+    _g8dGenTimerSynced = true;
+  }
+  if (phaseEl && job.phase) phaseEl.textContent = job.phase;
+  if (detailEl && job.detail) detailEl.textContent = job.detail;
+}
+
+function _clearG8dJobState() {
+  _g8dGenJobId = null;
+  _g8dGenPollFails = 0;
+  _rememberG8dJob('');
 }
 
 function _finishG8dGenStatus(ok, meta) {
   _stopG8dGenTimers();
+  _stopG8dGenPolling();
+  _clearG8dJobState();
+  _g8dGenRemote = false;
   const box = document.getElementById('g8dGenStatus');
   const timerEl = document.getElementById('g8dGenTimer');
   const spinner = document.getElementById('g8dGenSpinner');
@@ -3795,31 +4028,112 @@ function _finishG8dGenStatus(ok, meta) {
   }
 }
 
+// 轮询后台任务：真实状态来自服务端，每 2s 一次；失败 5 次才判定失联
+async function _poll8DJob(jobId) {
+  _stopG8dGenPolling();
+  _g8dGenJobId = jobId;
+  _g8dGenPollFails = 0;
+  _rememberG8dJob(jobId);
+
+  const tick = async () => {
+    if (_g8dGenJobId !== jobId) return;
+    let r;
+    try { r = await api('/api/8d/job?id=' + encodeURIComponent(jobId)); }
+    catch (e) { r = { success: false, error: (e && e.message) || String(e) }; }
+    if (_g8dGenJobId !== jobId) return;
+
+    if (!r || !r.success) {
+      if (/不存在|过期/.test((r && r.error) || '')) {
+        _finishG8dGenStatus(false, { message: '上次任务已结束或已过期，请重新生成' });
+        _setG8dGenControls(false);
+        return;
+      }
+      _g8dGenPollFails++;
+      if (_g8dGenPollFails >= 5) {
+        _finishG8dGenStatus(false, { message: '无法获取任务状态：' + ((r && r.error) || '网络异常') + '（任务可能仍在后台运行）' });
+        _setG8dGenControls(false);
+        return;
+      }
+      _g8dGenPollTimer = setTimeout(tick, 2000);
+      return;
+    }
+
+    _g8dGenPollFails = 0;
+    const job = r.job || r;
+    _applyG8dJob(job);
+
+    if (job.status === 'success') {
+      const res = job.result || {};
+      _finishG8dGenStatus(true, {
+        message: res.message || '8D 已生成',
+        elapsed_s: res.elapsed_s != null ? res.elapsed_s : job.elapsed_s,
+        qualified: res.qualified,
+        total_score: res.total_score,
+        thread_id: res.thread_id,
+        round_logs: res.round_logs,
+      });
+      _setG8dGenControls(false);
+      const scoreHint = (res.qualified || res.total_score)
+        ? `（${res.qualified || ''}${res.total_score != null ? ' · ' + res.total_score + '分' : ''}）`
+        : '';
+      const timeHint = job.elapsed_s != null ? ` · 总耗时 ${_fmtElapsed(job.elapsed_s)}` : '';
+      toast((res.message || '8D已生成') + scoreHint + timeHint, res.ok === false ? 'info' : 'ok');
+      load8DList();
+      if (res.report && res.report.id) {
+        // 仅当用户仍在 8D 页且未在编辑其他报告时才自动打开，避免打断当前编辑/切页
+        const onPage = !!(document.getElementById('page-8d') || {}).classList?.contains('active');
+        const editorOpened = !!(_8dEditData && Object.keys(_8dEditData).length);
+        const editingOther = editorOpened && _8dEditData.id && _8dEditData.id !== res.report.id;
+        if (onPage && !editingOther) {
+          setTimeout(() => {
+            hideGenPanel();
+            open8D(res.report.id);
+          }, 800);
+        }
+      }
+      return;
+    }
+
+    if (job.status === 'error') {
+      _finishG8dGenStatus(false, { message: job.error || '生成失败' });
+      _setG8dGenControls(false);
+      toast('生成失败: ' + (job.error || ''), 'err');
+      return;
+    }
+
+    _g8dGenPollTimer = setTimeout(tick, 2000);
+  };
+
+  tick();
+}
+
 function show8DGeneratePanel(opts) {
   document.getElementById('genPanel').style.display = 'block';
-  const custom = document.getElementById('g8dPartCustom');
-  if (custom) { custom.style.display = 'none'; custom.value = ''; }
+  _g8dAlertCtx = (opts && opts.alert_id)
+    ? {
+        alert_id: String(opts.alert_id),
+        fiscal_period: String(opts.fiscal_period || ''),
+        part: String(opts.part || ''),
+      }
+    : null;
   const problemEl = document.getElementById('g8dProblem');
   if (problemEl && !(opts && opts.keepProblem)) problemEl.value = (opts && opts.problem_desc) || '';
   if (!_g8dGenBusy) {
-    const box = document.getElementById('g8dGenStatus');
-    if (box) box.style.display = 'none';
-    _stopG8dGenTimers();
-  }
-  load8DPartOptions().then(() => {
-    if (opts && opts.part) {
-      const sel = document.getElementById('g8dPartSelect');
-      if (!sel) return;
-      const part = String(opts.part).trim();
-      if ([...sel.options].some(o => o.value === part)) {
-        sel.value = part;
-        onG8dPartChange();
-      } else {
-        sel.value = '__custom__';
-        onG8dPartChange();
-        if (custom) { custom.value = part; custom.style.display = 'block'; }
-      }
+    const stale = _recalledG8dJob();
+    if (stale) {
+      // 页面刷新/关闭面板后回来：接回仍在跑的任务
+      _setG8dGenControls(true);
+      _startG8dGenStatus(true);
+      _poll8DJob(stale);
+    } else {
+      const box = document.getElementById('g8dGenStatus');
+      if (box) box.style.display = 'none';
+      _stopG8dGenTimers();
+      _stopG8dGenPolling();
     }
+  }
+  fillPartSelects().then(() => {
+    if (opts && opts.part) setPartSelectValue('g8dPartSelect', opts.part);
   });
 }
 function hideGenPanel() {
@@ -3831,77 +4145,34 @@ function hideGenPanel() {
   _stopG8dGenTimers();
 }
 
-function onG8dPartChange() {
-  const sel = document.getElementById('g8dPartSelect');
-  const custom = document.getElementById('g8dPartCustom');
-  if (!sel || !custom) return;
-  if (sel.value === '__custom__') {
-    custom.style.display = 'block';
-    custom.focus();
-  } else {
-    custom.style.display = 'none';
-    custom.value = '';
-  }
-}
-
 function getG8dPartValue() {
-  const sel = document.getElementById('g8dPartSelect');
-  const custom = document.getElementById('g8dPartCustom');
-  if (!sel) return '';
-  if (sel.value === '__custom__') return (custom && custom.value || '').trim();
-  return (sel.value || '').trim();
+  return getPartSelectValue('g8dPartSelect');
 }
 
 async function load8DPartOptions() {
-  const sel = document.getElementById('g8dPartSelect');
-  if (!sel) return;
-  const prev = sel.value;
-  sel.innerHTML = '<option value="">加载料号中…</option>';
-  sel.disabled = true;
-  const r = await api('/api/dashboard');
-  const parts = r.top_defect_parts || [];
-  let html = '<option value="">请选择料号…</option>';
-  parts.forEach(p => {
-    const code = (p.PartNumber || p.part || '').trim();
-    if (!code) return;
-    const name = (p.PartName || '').trim();
-    const rate = p.RejectRate != null && p.RejectRate !== '' ? Number(p.RejectRate).toFixed(2) + '%' : '—';
-    const reject = p.TotalReject != null ? Number(p.TotalReject).toLocaleString('zh-CN') : '—';
-    const label = name && name !== code
-      ? `${code} · ${name}（报废 ${reject} / ${rate}）`
-      : `${code}（报废 ${reject} / ${rate}）`;
-    const safeCode = String(code).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-    const safeLabel = String(label).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-    html += `<option value="${safeCode}">${safeLabel}</option>`;
-  });
-  html += '<option value="__custom__">其他料号…（手动输入）</option>';
-  sel.innerHTML = html;
-  sel.disabled = false;
-  if (prev && [...sel.options].some(o => o.value === prev)) {
-    sel.value = prev;
-  } else {
-    sel.value = '';
-  }
-  onG8dPartChange();
-  if (!parts.length) toast('当月暂无 TOP 报废料号，请选「其他料号…」手动输入', 'info');
+  await fillPartSelects(['g8dPartSelect']);
 }
 
 async function generate8D() {
   if (_g8dGenBusy) { toast('正在生成中，请稍候', 'info'); return; }
   const part = getG8dPartValue();
-  if (!part) { toast('请选择或输入料号', 'err'); return; }
-  if (part === '__custom__') { toast('请输入其他料号', 'err'); return; }
+  if (!part) { toast('请选择料号', 'err'); return; }
   const problem = (document.getElementById('g8dProblem') || {}).value || '';
   if (!problem.trim()) { toast('请填写问题描述', 'err'); return; }
 
   _setG8dGenControls(true);
-  _startG8dGenStatus();
-  toast('已开始生成，请关注下方状态与用时', 'info');
+  _startG8dGenStatus(true);
+  toast('已提交后台生成，页面会自动刷新进度', 'info');
 
-  const body = { part_no: part, problem_desc: problem.trim() };
+  // 后台任务模式：提交只等创建任务，避免单个请求干等 180s
+  const body = { part_no: part, problem_desc: problem.trim(), async: true };
+  if (_g8dAlertCtx && _g8dAlertCtx.alert_id && _g8dAlertCtx.part === part) {
+    body.alert_id = _g8dAlertCtx.alert_id;
+    if (_g8dAlertCtx.fiscal_period) body.fiscal_period = _g8dAlertCtx.fiscal_period;
+  }
   let r;
   try {
-    r = await apiPost('/api/8d/generate', body, { timeoutMs: 200000 });
+    r = await apiPost('/api/8d/generate', body, { timeoutMs: 20000 });
   } catch (e) {
     r = { success: false, error: (e && e.message) || String(e) };
   }
@@ -3912,7 +4183,14 @@ async function generate8D() {
     toast('生成失败: ' + ((r && r.error) || ''), 'err');
     return;
   }
+  _g8dAlertCtx = null;
 
+  if (r.job_id) {
+    _poll8DJob(r.job_id);
+    return;
+  }
+
+  // 兼容未启用 async 的旧后端：直接使用同步返回结果
   _finishG8dGenStatus(true, {
     message: r.message || '8D已生成',
     elapsed_s: r.elapsed_s,
@@ -3922,7 +4200,6 @@ async function generate8D() {
     round_logs: r.round_logs,
   });
   _setG8dGenControls(false);
-
   const scoreHint = (r.qualified || r.total_score)
     ? `（${r.qualified || ''}${r.total_score != null ? ' · ' + r.total_score + '分' : ''}）`
     : '';
@@ -3930,7 +4207,6 @@ async function generate8D() {
   toast((r.message || '8D已生成') + scoreHint + timeHint, r.ok === false ? 'info' : 'ok');
   load8DList();
   if (r.report?.id) {
-    // 稍留结果条给用户看一眼用时，再打开编辑器
     setTimeout(() => {
       hideGenPanel();
       open8D(r.report.id);
@@ -3938,22 +4214,10 @@ async function generate8D() {
   }
 }
 
-function new8D() {
-  const part = prompt('手动新建需填写真实料号（可在编辑页检索知识库写入 D4/D5，不会自动编造根因）：');
-  if (!part || !part.trim()) return;
-  const rp = {
-    id: '8D-' + part.trim().slice(0, 8) + '-' + Date.now(),
-    report_no: 'QHC-8D-' + new Date().toISOString().slice(0,10).replace(/-/g,'') + '-M',
-    part_number: part.trim(), customer: '', problem: '',
-    d1:'', d2:'', d3:'',
-    d4:'【根因待现场填写】可从下方知识库检索后写入；禁止粘贴未经验证的通用模板作为结论',
-    d5:'【对策待制定】可从知识库写入参考对策；关闭前须确认可验证',
-    d6:'', d7:'', d8:'',
-    status: 'open', severity: 3, created_by: 'User',
-    data_policy: 'manual_draft+knowledge_lookup',
-    knowledge_refs: { refs: [], hit_count: 0 }
-  };
-  show8DEditor(rp);
+async function new8D() {
+  await fillPartSelects();
+  show8DGeneratePanel({});
+  toast('请在下拉中选择 ERP 实据料号后生成；也可打开已有报告编辑', 'info');
 }
 
 async function open8D(id) {
@@ -4101,7 +4365,7 @@ function render8DEvidence(rp) {
         ${scoreBits ? `<div style="margin-top:4px;">${scoreBits}</div>` : ''}
         ${ev.thread_id ? `<div>thread <code>${_esc(ev.thread_id)}</code></div>` : ''}
         ${logLine ? `<div style="margin-top:2px;color:var(--text2);">步骤：${_esc(logLine)}</div>` : ''}
-        <div style="margin-top:4px;color:var(--text2);">说明：指标与根因来自 8D 服务闭环结果，须现场复核后定稿。</div>
+        <div style="margin-top:4px;color:var(--text2);">说明：D4/D5 仅保留 GraphRAG / 历史已验证 8D 可追溯条目，未命中项已转待现场确认；定稿前须现场复核。</div>
       </div>`;
     return;
   }
@@ -4132,7 +4396,7 @@ function render8DEvidence(rp) {
       <div>MES 检验笔数：${_esc(ev ? fmt(ev.mes_inspect_count) : '—')} · 均良率 ${_esc(ev && ev.mes_avg_yield != null ? ev.mes_avg_yield + '%' : '—')}</div>
       <div>数据源：${_esc(srcTxt)}</div>
       <div style="margin-top:4px;">历史关闭方案：${_esc(refLine)}</div>
-      <div>知识库命中：${_esc(kbLine)}${kbN ? `（${kbN} 条 GraphRAG）` : ''}</div>
+      <div>知识库命中：${_esc(kbLine)}${kbN ? `（${kbN} 条可追溯）` : ''}</div>
     </div>`;
 }
 
@@ -4143,7 +4407,8 @@ function render8DKnowledge(rp) {
   let refs = kb.refs || [];
   const external = _isExternal8D(rp);
   // 智能生成：优先展示已写入的根因/对策；旧空稿从 D4/D5 回显
-  if (external && (!refs.length || !(kb.hit_count || refs.length))) {
+  // 已过可追溯闸门的稿（含 grounding）不再回显，避免把“待现场确认”当成根因展示
+  if (external && !kb.grounding && (!refs.length || !(kb.hit_count || refs.length))) {
     kb = _knowledgeFromD4D5(rp);
     refs = kb.refs || [];
   }
@@ -4307,7 +4572,7 @@ function show8DEditor(rp) {
   document.getElementById('edit8DPanel').style.display = 'block';
   document.getElementById('edit8DTitle').textContent = `8D — ${rp.report_no || rp.id}`;
   document.getElementById('e8dId').value = rp.id;
-  document.getElementById('e8dPart').value = rp.part_number || '';
+  setPartSelectValue('e8dPart', rp.part_number || '');
   document.getElementById('e8dCustomer').value = rp.customer || '';
   document.getElementById('e8dStatus').value = rp.status || 'open';
   document.getElementById('e8dProblem').value = rp.problem || '';
@@ -4359,12 +4624,11 @@ function collect8DBody() {
     || (_8dEditData.knowledge_refs ? JSON.stringify(_8dEditData.knowledge_refs) : '');
   const body = {
     id, report_no: _8dEditData.report_no || id,
-    part_number: document.getElementById('e8dPart').value.trim(),
+    part_number: getPartSelectValue('e8dPart'),
     customer: document.getElementById('e8dCustomer').value,
     problem: document.getElementById('e8dProblem').value,
     status: document.getElementById('e8dStatus').value,
     severity: _8dEditData.severity || 3,
-    created_by: _8dEditData.created_by || 'User',
     created_at: _8dEditData.created_at,
     data_policy: _8dEditData.data_policy || '',
     evidence_json: _8dEditData.evidence_json || '',
@@ -4372,6 +4636,8 @@ function collect8DBody() {
     knowledge_refs_json: kbJson || '[]',
     defects_json: _8dEditData.defects_json || '[]',
   };
+  // 新建稿不伪造操作人：由后端取当前登录会话用户名
+  if (_8dEditData.created_by) body.created_by = _8dEditData.created_by;
   D_LABELS.forEach(d => {
     const key = d.toLowerCase();
     const el = document.getElementById('e8d_' + key);
@@ -4391,10 +4657,6 @@ async function save8D() {
 async function closeAndPromote8D() {
   const body = collect8DBody();
   if (!body.part_number) { toast('料号不能为空', 'err'); return; }
-  const d4 = body.d4 || '';
-  const d5 = body.d5 || '';
-  if (d4.includes('待排查') && d4.includes('暂无已关闭') && !confirm('D4 仍含「待排查」。确认已现场核实并关闭？')) return;
-  if (d5.includes('待制定') && !confirm('D5 仍含「待制定」。确认对策已落实并关闭？')) return;
   body.status = 'closed';
   document.getElementById('e8dStatus').value = 'closed';
   const r = await apiPost('/api/8d/save', body);
@@ -4529,33 +4791,35 @@ async function loadAlerts() {
   const typeLabel = { scrap_rate:'报废率超标', process_yield:'工序良率低', trend_deterioration:'趋势恶化' };
   let html = '';
   alerts.forEach(a => {
-    const lvl = a.level || 'warning';
+    const lvl = ['critical','warning','ok'].includes(String(a.level || '')) ? String(a.level) : 'warning';
     const icon = lvl === 'critical' ? '🔴' : lvl === 'warning' ? '🟡' : '🔵';
-    const idSafe = String(a.id || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const idJson = _esc(JSON.stringify(String(a.id || '')));
     const part = a.part_number || '';
-    const partSafe = String(part).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     const canTrace = part && part !== '全厂';
+    const partJson = _esc(JSON.stringify(String(part)));
+    const msgJson = _esc(JSON.stringify(String(a.message || '')));
+    const fpJson = _esc(JSON.stringify(String(a.fiscal_period || '')));
     html += `<div class="alert-card ${lvl}">
       <div class="alert-icon">${icon}</div>
       <div class="alert-body" style="flex:1;">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
           <div style="flex:1;min-width:0;">
-            <div class="alert-title">[${typeLabel[a.alert_type] || a.alert_type || '品质预警'}] ${a.message || ''}</div>
-            <div class="alert-suggest" style="margin-top:4px;">💡 ${a.suggestion || '建议排查处理'}</div>
+            <div class="alert-title">[${_esc(typeLabel[a.alert_type] || a.alert_type || '品质预警')}] ${_esc(a.message || '')}</div>
+            <div class="alert-suggest" style="margin-top:4px;">💡 ${_esc(a.suggestion || '建议排查处理')}</div>
             <div style="margin-top:6px;font-size:11px;color:var(--text2);">
-              料号：${part || '—'} · 工序：${a.process_name || '—'} · 指标 ${a.metric_value ?? '—'} / 阈值 ${a.threshold ?? '—'}
-              ${a.data_source ? ` · <span style="color:var(--green)">来源 ${a.data_source}</span>` : ''}
+              料号：${_esc(part || '—')} · 工序：${_esc(a.process_name || '—')} · 指标 ${a.metric_value ?? '—'} / 阈值 ${a.threshold ?? '—'}
+              ${a.data_source ? ` · <span style="color:var(--green)">来源 ${_esc(a.data_source)}</span>` : ''}
             </div>
-            ${a.evidence ? `<div style="margin-top:2px;font-size:10px;color:var(--text2);opacity:.85;">证据：${a.evidence}</div>` : ''}
+            ${a.evidence ? `<div style="margin-top:2px;font-size:10px;color:var(--text2);opacity:.85;">证据：${_esc(a.evidence)}</div>` : ''}
           </div>
           <div style="text-align:right;min-width:148px;flex-shrink:0;">
-            <div class="alert-time">${fmtAlertTime(a.created_at)}</div>
+            <div class="alert-time">${_esc(fmtAlertTime(a.created_at))}</div>
             <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;margin-top:8px;">
               ${a.acknowledged
                 ? `<span class="badge badge-ok">已确认</span>`
-                : `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="ackAlert('${idSafe}')">✓ 确认</button>`}
-              ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="gotoTraceFromAlert('${partSafe}')">🔍 追溯</button>` : ''}
-              ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="create8DFromAlert('${partSafe}', '${String(a.message || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r?\n/g,' ')}')">📋 转8D</button>` : ''}
+                : `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="ackAlert(${idJson})">✓ 确认</button>`}
+              ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="gotoTraceFromAlert(${partJson})">🔍 追溯</button>` : ''}
+              ${canTrace ? `<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="create8DFromAlert(${partJson}, ${msgJson}, ${idJson}, ${fpJson})">📋 转8D</button>` : ''}
             </div>
           </div>
         </div>
@@ -4580,16 +4844,20 @@ async function ackAlert(id) {
 }
 
 function gotoTraceFromAlert(part) {
-  document.getElementById('tPart').value = part;
+  setPartSelectValue('tPart', part);
   showPage('trace');
   runTrace();
 }
 
-async function create8DFromAlert(part, message) {
+async function create8DFromAlert(part, message, alertId, fiscalPeriod) {
   if (!part) return;
   showPage('8d');
   const hint = (message || '').trim() || (`品质预警转8D · 料号 ${part}`);
-  show8DGeneratePanel({ part, problem_desc: hint });
+  show8DGeneratePanel({
+    part, problem_desc: hint,
+    alert_id: alertId || '',
+    fiscal_period: fiscalPeriod || '',
+  });
   toast('已带入料号与预警信息，请确认问题描述后点「生成」', 'info');
 }
 
@@ -4716,12 +4984,12 @@ async function loadKnowledge() {
 async function loadHistory() {
   const el = document.getElementById('historyList');
   const meta = document.getElementById('histMeta');
-  const part = (document.getElementById('histPart') || {}).value || '';
+  const part = getPartSelectValue('histPart');
   const grade = (document.getElementById('histGrade') || {}).value || '';
   el.innerHTML = '<div class="loading"><div class="spinner"></div>加载中...</div>';
 
   let url = '/api/history?limit=80';
-  if (part.trim()) url += `&part=${encodeURIComponent(part.trim())}`;
+  if (part) url += `&part=${encodeURIComponent(part)}`;
   if (grade) url += `&grade=${encodeURIComponent(grade)}`;
   const r = await api(url);
   if (!r.success || !(r.reports || []).length) {
@@ -4740,12 +5008,12 @@ async function loadHistory() {
     const score = parseFloat(rp.overall_score || 0);
     const color = score >= 90 ? 'var(--green)' : score >= 75 ? 'var(--blue)' : score >= 60 ? 'var(--yellow)' : 'var(--red)';
     const hasEv = !!rp.has_evidence;
-    const idSafe = String(rp.id || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const idJson = _esc(JSON.stringify(String(rp.id || '')));
     const period = rp.fiscal_period
       ? `FP ${rp.fiscal_period}`
       : (rp.date_range || '—');
     html += `<tr>
-      <td class="hl" style="cursor:pointer;" onclick="openHistDetail('${idSafe}')">${_esc(rp.report_no || rp.id)}</td>
+      <td class="hl" style="cursor:pointer;" onclick="openHistDetail(${idJson})">${_esc(rp.report_no || rp.id)}</td>
       <td>${_esc(rp.part_number || '—')}</td>
       <td style="font-size:12px;">${_esc(period)}</td>
       <td style="font-size:12px;">${rp.scrap_rate != null ? pct(rp.scrap_rate) : '—'}</td>
@@ -4757,7 +5025,7 @@ async function loadHistory() {
         : '<span class="badge badge-warn">旧摘要</span>'}</td>
       <td style="font-size:12px;color:var(--text2);">${_esc(String(rp.created_at || '').replace('T', ' ').substring(0, 16))}</td>
       <td style="white-space:nowrap;">
-        <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;" onclick="openHistDetail('${idSafe}')">详情</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;" onclick="openHistDetail(${idJson})">详情</button>
       </td>
     </tr>`;
   });
@@ -5014,6 +5282,7 @@ function ensureChart(domId) {
 function animateKpi(id, value, isPct) {
   const el = document.getElementById(id);
   if (!el) return;
+  if (value === null || value === undefined) { el.textContent = '—'; return; }
   const target = Number(value) || 0;
   const start = 0;
   const dur = 700;
@@ -5069,12 +5338,15 @@ function renderDashScrapChart(mode, parts, items) {
     chart.setOption({
       ...ECHART_DARK,
       title: {
-        text: '暂无报废料号数据', left: 'center', top: 'middle',
+        text: mode === 'low_yield' ? '暂无 MES 工序数据' : '暂无报废料号数据',
+        left: 'center', top: 'middle',
         textStyle: { color: '#8b949e', fontSize: 13, fontWeight: 400 },
       },
     });
     return;
   }
+  const isProcess = mode === 'low_yield';
+  chart.off('click');
   chart.setOption({
     ...ECHART_DARK,
     tooltip: {
@@ -5083,12 +5355,19 @@ function renderDashScrapChart(mode, parts, items) {
       formatter: (params) => {
         const i = params[0].dataIndex;
         const row = data[i];
-        const rate = row.RejectRate == null ? '—' : (row.RejectRate + '%');
-        return `${row.PartNumber}<br/>报废: ${fmt(row.TotalReject)}<br/>投入: ${fmt(row.TotalInput)}<br/>报废率: ${rate}`;
+        const rate = row.RejectRate == null ? null : Number(row.RejectRate);
+        if (isProcess) {
+          const unitRate = row.UnitFirstPassRate == null ? null : Number(row.UnitFirstPassRate);
+          return `${_esc(row.PartNumber)}<br/>检验: ${fmt(row.TotalInput)} 次<br/>NG: ${fmt(row.TotalReject)}`
+            + `<br/>检验通过率: ${rate == null ? '—' : (100 - rate).toFixed(2) + '%'}`
+            + `<br/>单板一次通过率: ${unitRate == null ? '—' : unitRate.toFixed(2) + '%'}`;
+        }
+        return `${_esc(row.PartNumber)}<br/>报废: ${fmt(row.TotalReject)}<br/>投入: ${fmt(row.TotalInput)}<br/>报废率: ${rate == null ? '—' : rate + '%'}`
+          + '<br/><span style="color:#8b949e">点击打开决策卡</span>';
       }
     },
     grid: { left: 100, right: 48, top: 18, bottom: 28 },
-    xAxis: { type: 'value', name: '报废PCS', nameTextStyle: { color: '#8b949e' },
+    xAxis: { type: 'value', name: isProcess ? '检验NG数' : '报废PCS', nameTextStyle: { color: '#8b949e' },
       splitLine: { lineStyle: { color: '#30363d', type: 'dashed' } }, axisLabel: { color: '#8b949e' } },
     yAxis: {
       type: 'category',
@@ -5115,6 +5394,16 @@ function renderDashScrapChart(mode, parts, items) {
       emphasis: { focus: 'series' },
     }]
   });
+  if (!isProcess) {
+    chart.on('click', (params) => {
+      const row = data[params.dataIndex];
+      const code = row && row.PartNumber;
+      if (!code) return;
+      loadPartSpotlight(code, window._dashFiscalPeriod || '');
+      const el = document.getElementById('dashSpotlight');
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  }
 }
 
 function renderDashProcessChart(rows) {
@@ -5208,8 +5497,8 @@ function renderDashDefectPie(items) {
         const p = params[0];
         const row = data[p.dataIndex];
         const pct = (row.value / total * 100).toFixed(1);
-        const proc = row.process ? `<br/>工序: ${row.process}` : '';
-        return `${row.name}${proc}<br/>报废: ${fmt(row.value)} PCS<br/>占比: ${pct}%`;
+        const proc = row.process ? `<br/>工序: ${_esc(row.process)}` : '';
+        return `${_esc(row.name)}${proc}<br/>报废: ${fmt(row.value)} PCS<br/>占比: ${pct}%`;
       }
     },
     grid: { left: 88, right: 56, top: 12, bottom: 16 },
@@ -5262,7 +5551,8 @@ function renderDashDefectPie(items) {
 function renderDashGauge(rate) {
   const chart = ensureChart('chartScrapGauge');
   if (!chart) return;
-  const val = Number(rate) || 0;
+  const unknown = (rate === null || rate === undefined);
+  const val = unknown ? 0 : (Number(rate) || 0);
   chart.setOption({
     ...ECHART_DARK,
     series: [{
@@ -5299,7 +5589,7 @@ function renderDashGauge(rate) {
       anchor: { show: true, size: 10, itemStyle: { color: '#58a6ff', shadowBlur: 10, shadowColor: '#58a6ff' } },
       detail: {
         valueAnimation: true,
-        formatter: (v) => Number(v).toFixed(2) + '%',
+        formatter: (v) => unknown ? '—' : Number(v).toFixed(2) + '%',
         color: '#f0f6fc', fontSize: 22, fontWeight: 700,
         offsetCenter: ['0%', '12%'],
       },
@@ -5313,7 +5603,8 @@ function renderDashGauge(rate) {
 function renderDashYieldGauge(latest, avg) {
   const chart = ensureChart('chartYieldGauge');
   if (!chart) return;
-  const v = Math.max(0, Math.min(100, Number(latest) || 0));
+  const unknown = (latest === null || latest === undefined);
+  const v = unknown ? 0 : Math.max(0, Math.min(100, Number(latest) || 0));
   const avgV = Math.max(0, Math.min(100, Number(avg) || 0));
   const color = v >= 98 ? '#3fb950' : v >= 90 ? '#d29922' : '#f85149';
   chart.setOption({
@@ -5352,7 +5643,7 @@ function renderDashYieldGauge(latest, avg) {
       anchor: { show: true, size: 10, itemStyle: { color, shadowBlur: 10, shadowColor: color } },
       detail: {
         valueAnimation: true,
-        formatter: (val) => Number(val).toFixed(1) + '%',
+        formatter: (val) => unknown ? '—' : Number(val).toFixed(1) + '%',
         color: '#f0f6fc', fontSize: 22, fontWeight: 700,
         offsetCenter: ['0%', '10%'],
       },
@@ -5468,6 +5759,110 @@ function drawTrendCanvas(canvas, data) {
 // ════════════════════════════════════════════════
 // 初始化
 // ════════════════════════════════════════════════
+async function fillProcessSelects() {
+  const ids = ['ipqcProcess', 'spcProcess'];
+  let processes = ['钻孔', '蚀刻', '阻焊', '成型', '待确认工序'];
+  try {
+    const d = await api('/api/processes');
+    if (d && Array.isArray(d.processes) && d.processes.length) {
+      processes = d.processes;
+    }
+  } catch (e) { /* 用内置目录 */ }
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el || el.tagName !== 'SELECT') return;
+    const cur = el.value || '';
+    el.innerHTML = '<option value="">全部工序</option>' +
+      processes.map(p => `<option value="${_escOpt(p)}">${_escOpt(p)}</option>`).join('');
+    if (cur) el.value = cur;
+  });
+}
+
+// ─── 料号下拉（ERP 实据，禁止手输编造）─────────────────
+const PART_SELECT_CONFIG = [
+  { id: 'hPart', empty: '全部料号（全厂）' },
+  { id: 'sPart', empty: '全部料号' },
+  { id: 'copqPart', empty: '全部料号' },
+  { id: 'tPart', empty: '请选择料号…' },
+  { id: 'g8dPartSelect', empty: '请选择料号…' },
+  { id: 'filter8DPart', empty: '全部料号' },
+  { id: 'e8dPart', empty: '请选择料号…' },
+  { id: 'histPart', empty: '全部料号' },
+];
+let _partOptionsCache = null;
+let _partOptionsLoading = null;
+
+function _escOpt(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function getPartSelectValue(id) {
+  const el = document.getElementById(id);
+  return el ? String(el.value || '').trim() : '';
+}
+
+function setPartSelectValue(id, code) {
+  const el = document.getElementById(id);
+  if (!el || el.tagName !== 'SELECT') return;
+  const v = String(code || '').trim();
+  if (!v) { el.value = ''; return; }
+  if (![...el.options].some(o => o.value === v)) {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v;
+    el.appendChild(opt);
+  }
+  el.value = v;
+}
+
+async function loadPartOptions(force) {
+  if (!force && _partOptionsCache) return _partOptionsCache;
+  if (_partOptionsLoading) return _partOptionsLoading;
+  _partOptionsLoading = (async () => {
+    try {
+      const fpEl = document.getElementById('dashPeriod');
+      const fp = (fpEl && fpEl.value) ? String(fpEl.value).replace('-', '') : '';
+      let url = '/api/parts?limit=400';
+      if (fp) url += `&fiscal_period=${encodeURIComponent(fp)}`;
+      const d = await api(url);
+      _partOptionsCache = Array.isArray(d && d.parts) ? d.parts : [];
+    } catch (e) {
+      _partOptionsCache = [];
+    } finally {
+      _partOptionsLoading = null;
+    }
+    return _partOptionsCache;
+  })();
+  return _partOptionsLoading;
+}
+
+async function fillPartSelects(onlyIds) {
+  const parts = await loadPartOptions(false);
+  const configs = onlyIds
+    ? PART_SELECT_CONFIG.filter(c => onlyIds.includes(c.id))
+    : PART_SELECT_CONFIG;
+  configs.forEach(cfg => {
+    const el = document.getElementById(cfg.id);
+    if (!el || el.tagName !== 'SELECT') return;
+    const cur = el.value || '';
+    let html = `<option value="">${_escOpt(cfg.empty || '请选择料号…')}</option>`;
+    parts.forEach(p => {
+      const code = String(p.part_number || p.PartNumber || '').trim();
+      if (!code) return;
+      const name = String(p.part_name || p.PartName || '').trim();
+      const scrap = p.scrap_pcs != null ? Number(p.scrap_pcs) : null;
+      let label = name && name !== code ? `${code} · ${name}` : code;
+      if (scrap != null && scrap > 0) {
+        label += `（报废 ${scrap.toLocaleString('zh-CN')}）`;
+      }
+      html += `<option value="${_escOpt(code)}">${_escOpt(label)}</option>`;
+    });
+    el.innerHTML = html;
+    if (cur) setPartSelectValue(cfg.id, cur);
+  });
+  return parts;
+}
+
 (async function init() {
   // 设置默认日期
   setDefaultDates('hStart', 'hEnd');
@@ -5477,6 +5872,8 @@ function drawTrendCanvas(canvas, data) {
   // 检查登录态与连接（顶栏仅展示工程配置中的当前环境名，不可切换）
   await loadCurrentUser();
   await checkHealth();
+  await fillProcessSelects();
+  await fillPartSelects();
 
   // 加载仪表板
   await loadDashboard();

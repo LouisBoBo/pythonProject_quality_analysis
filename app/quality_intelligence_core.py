@@ -27,6 +27,11 @@ from collections import defaultdict
 import threading
 import re
 
+try:
+    from app.date_window import end_exclusive
+except ImportError:  # 以 app/ 为顶层目录直接运行时
+    from date_window import end_exclusive
+
 # ─────────────────────────────────────────────
 # 日志配置
 # ─────────────────────────────────────────────
@@ -496,9 +501,9 @@ class QualityIntelligenceCore:
                 conditions.append("wo.createDate >= ?")
                 params.append(start_date)
             if end_date:
-                conditions.append("wo.createDate <= ?")
-                params.append(f"{end_date} 23:59:59")
-            
+                conditions.append("wo.createDate < ?")
+                params.append(end_exclusive(end_date))
+
             where_sql = " AND ".join(conditions)
             
             # 查询工单数据
@@ -520,7 +525,7 @@ class QualityIntelligenceCore:
                 ORDER BY wo.createDate DESC
             """
             
-            result = self.erp.execute(sql)
+            result = self.erp.execute(sql, params)
             if result.get("success") and result.get("data"):
                 work_orders = result["data"]
                 
@@ -565,8 +570,8 @@ class QualityIntelligenceCore:
                 conditions.append("r.CDATETIME_CREATED >= ?")
                 params.append(start_date)
             if end_date:
-                conditions.append("r.CDATETIME_CREATED <= ?")
-                params.append(f"{end_date} 23:59:59")
+                conditions.append("r.CDATETIME_CREATED < ?")
+                params.append(end_exclusive(end_date))
             
             where_sql = " AND ".join(conditions)
             
@@ -581,7 +586,7 @@ class QualityIntelligenceCore:
                 ORDER BY r.CDATETIME_CREATED DESC
             """
             
-            result = self.mes.execute(sql)
+            result = self.mes.execute(sql, params)
             if result.get("success"):
                 logger.info(f"MES数据分析完成: {result.get('row_count', 0)} 条记录")
 
@@ -608,9 +613,9 @@ class QualityIntelligenceCore:
                     conditions.append("wo.createDate >= ?")
                     params.append(start_date)
                 if end_date:
-                    conditions.append("wo.createDate <= ?")
-                    params.append(f"{end_date} 23:59:59")
-                
+                    conditions.append("wo.createDate < ?")
+                    params.append(end_exclusive(end_date))
+
                 where_sql = " AND ".join(conditions)
                 
                 # 按料号统计缺陷
@@ -630,7 +635,7 @@ class QualityIntelligenceCore:
                     ORDER BY SUM(wo.reject_PCS) DESC
                 """
                 
-                result = self.erp.execute(sql)
+                result = self.erp.execute(sql, params)
                 if result.get("success") and result.get("data"):
                     for row in result["data"]:
                         defects.append({
@@ -943,21 +948,25 @@ class QualityIntelligenceCore:
             return result
 
         try:
-            # 构建查询条件（不使用参数化，直接拼接）
+            # 构建查询条件（参数绑定，禁止把用户输入拼进 SQL）
             where_parts = []
+            params = []
             if part_number:
-                where_parts.append(f"mp.mfgPartCode LIKE '%{part_number}%'")
+                where_parts.append("mp.mfgPartCode LIKE ?")
+                params.append(f"%{part_number}%")
             if start_date:
-                where_parts.append(f"wo.createDate >= '{start_date}'")
+                where_parts.append("wo.createDate >= ?")
+                params.append(start_date)
             if end_date:
-                where_parts.append(f"wo.createDate <= '{end_date} 23:59:59'")
+                where_parts.append("wo.createDate < ?")
+                params.append(end_exclusive(end_date))
             
             where_sql = " AND ".join(where_parts) if where_parts else "1=1"
 
             # 查询工单数据
             sql = f"SELECT TOP 100 wo.woNumber, mp.mfgPartCode AS PartNumber, mp.mfgPartName AS PartName, wo.qty_PCS_PRODUCED AS PcsProduced, wo.reject_PCS AS RejectPcs, wo.defect_PCS AS DefectPcs, wo.qty_PNL_PRODUCED AS PnlProduced, wo.createDate, wo.endDate, wo.status FROM P_WO wo INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId WHERE {where_sql} ORDER BY wo.createDate DESC"
 
-            query_result = self.erp.execute(sql)
+            query_result = self.erp.execute(sql, params)
 
             if query_result.get("success") and query_result.get("data"):
                 work_orders = query_result["data"]
@@ -1031,17 +1040,21 @@ class QualityIntelligenceCore:
                 #    此视图与ERP报废明细报表完全一致
                 # ─────────────────────────────────────────────────────
                 insp_conditions = []
+                insp_params = []
                 if part_number:
-                    insp_conditions.append(f"v.MfgPartCode LIKE '%{part_number}%'")
+                    insp_conditions.append("v.MfgPartCode LIKE ?")
+                    insp_params.append(f"%{part_number}%")
                 else:
                     insp_conditions.append("1=1")
                 insp_conditions.append("v.TType = 1")           # 正式报废
                 insp_conditions.append("v.InspectionResult = 'Scrapped'")
 
                 if start_date:
-                    insp_conditions.append(f"v.CreateDate >= '{start_date}'")
+                    insp_conditions.append("v.CreateDate >= ?")
+                    insp_params.append(start_date)
                 if end_date:
-                    insp_conditions.append(f"v.CreateDate <= '{end_date} 23:59:59'")
+                    insp_conditions.append("v.CreateDate < ?")
+                    insp_params.append(end_exclusive(end_date))
 
                 insp_where = " AND ".join(insp_conditions)
 
@@ -1057,7 +1070,7 @@ class QualityIntelligenceCore:
                     GROUP BY v.MfgPartCode, v.InspectionItem, v.InspectionProcess
                     ORDER BY SUM(v.QtyOfUnit) DESC
                 """
-                defect_result = self.erp.execute(defect_sql)
+                defect_result = self.erp.execute(defect_sql, insp_params)
 
                 # 总报废PCS
                 total_sql = f"""
@@ -1065,7 +1078,7 @@ class QualityIntelligenceCore:
                     FROM View_P_Inspection v
                     WHERE {insp_where}
                 """
-                total_result = self.erp.execute(total_sql)
+                total_result = self.erp.execute(total_sql, insp_params)
                 if total_result.get("success") and total_result.get("data"):
                     row0 = total_result["data"][0]
                     total_scrap = int(row0.get("TotalScrap") or 0)
@@ -1076,12 +1089,16 @@ class QualityIntelligenceCore:
                 # 2. 从 P_WO 取投入PCS（产出+报废=总投入）
                 # ─────────────────────────────────────────────────────
                 wo_conditions = []
+                wo_params = []
                 if part_number:
-                    wo_conditions.append(f"mp.mfgPartCode LIKE '%{part_number}%'")
+                    wo_conditions.append("mp.mfgPartCode LIKE ?")
+                    wo_params.append(f"%{part_number}%")
                 if start_date:
-                    wo_conditions.append(f"wo.createDate >= '{start_date}'")
+                    wo_conditions.append("wo.createDate >= ?")
+                    wo_params.append(start_date)
                 if end_date:
-                    wo_conditions.append(f"wo.createDate <= '{end_date} 23:59:59'")
+                    wo_conditions.append("wo.createDate < ?")
+                    wo_params.append(end_exclusive(end_date))
                 wo_conditions.append("(wo.qty_PCS_PRODUCED > 0 OR wo.reject_PCS > 0)")
                 wo_where = " AND ".join(wo_conditions) if wo_conditions else "1=1"
 
@@ -1091,7 +1108,7 @@ class QualityIntelligenceCore:
                     INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
                     WHERE {wo_where}
                 """
-                input_result = self.erp.execute(input_sql)
+                input_result = self.erp.execute(input_sql, wo_params)
                 if input_result.get("success") and input_result.get("data"):
                     row0 = input_result["data"][0]
                     total_input = int(row0.get("TotalInput") or 0)
@@ -1132,8 +1149,10 @@ class QualityIntelligenceCore:
                 # 4. 月度趋势（从 View_P_Inspection 按月统计报废PCS）
                 # ─────────────────────────────────────────────────────
                 trend_conditions = []
+                trend_params = []
                 if part_number:
-                    trend_conditions.append(f"v.MfgPartCode LIKE '%{part_number}%'")
+                    trend_conditions.append("v.MfgPartCode LIKE ?")
+                    trend_params.append(f"%{part_number}%")
                 trend_conditions.append("v.TType = 1")
                 trend_conditions.append("v.InspectionResult = 'Scrapped'")
                 trend_where = " AND ".join(trend_conditions) if trend_conditions else "1=1"
@@ -1148,7 +1167,7 @@ class QualityIntelligenceCore:
                     GROUP BY CONVERT(VARCHAR(7), v.CreateDate, 120)
                     ORDER BY Month DESC
                 """
-                monthly_result = self.erp.execute(monthly_sql)
+                monthly_result = self.erp.execute(monthly_sql, trend_params)
                 if monthly_result.get("success") and monthly_result.get("data"):
                     # 需要投入数据计算月度报废率，从P_WO按月取
                     monthly_input_sql = f"""
@@ -1161,7 +1180,7 @@ class QualityIntelligenceCore:
                         GROUP BY CONVERT(VARCHAR(7), wo.createDate, 120)
                         ORDER BY Month DESC
                     """
-                    monthly_input_result = self.erp.execute(monthly_input_sql)
+                    monthly_input_result = self.erp.execute(monthly_input_sql, wo_params)
                     monthly_input_map = {}
                     if monthly_input_result.get("success") and monthly_input_result.get("data"):
                         for row in monthly_input_result["data"]:
@@ -1213,12 +1232,12 @@ class QualityIntelligenceCore:
                 # 必须先从ERP获取料号对应的工单号列表，再用工单号去MES查询
                 wo_list = []
                 if part_number and self.erp and self.erp.connected:
-                    erp_r = self.erp.execute(f"""
+                    erp_r = self.erp.execute("""
                         SELECT DISTINCT wo.woNumber
                         FROM P_WO wo
                         INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
-                        WHERE mp.mfgPartCode LIKE '%{part_number}%'
-                    """)
+                        WHERE mp.mfgPartCode LIKE ?
+                    """, [f"%{part_number}%"])
                     if erp_r.get("success") and erp_r.get("data"):
                         wo_list = [d.get("woNumber", "") for d in erp_r["data"] if d.get("woNumber")]
                         logger.info(f"MES工序查询: 料号 {part_number} 找到 {len(wo_list)} 个工单")
@@ -1315,7 +1334,8 @@ class QualityIntelligenceCore:
                 "supplier_quality": [],
                 "material_lots": [],
                 "iqc_pass_rate": 0,
-                "trace_coverage": 0
+                "iqc_sample_count": 0,
+                "trace_coverage": None
             }
         }
 
@@ -1339,27 +1359,26 @@ class QualityIntelligenceCore:
                 query_result = self.mes.execute(iqc_sql)
                 if query_result.get("success"):
                     data = query_result.get("data", [])
-                    if data:
-                        # 计算来料合格率
-                        total = len(data)
+                    total = len(data)
+                    if total:
+                        # 来料合格率：仅基于实际取样的检验记录
                         pass_count = sum(1 for d in data if d.get("Result") == 1)
-                        result["data"]["iqc_pass_rate"] = round(pass_count / total * 100, 2) if total > 0 else 0
-                        # 生成模拟供应商数据
-                        result["data"]["supplier_quality"] = [
-                            {"supplier": f"供应商{i+1}", "code": f"SUP{i+1:03d}",
-                             "total": 100 - i * 5, "pass": 95 - i * 4,
-                             "rate": 95 - i * 2} for i in range(10)
-                        ]
-                        result["data"]["trace_coverage"] = 85
-                    else:
-                        # 使用示例数据
-                        result["data"]["supplier_quality"] = [
-                            {"supplier": "示例供应商A", "code": "SUP001",
-                             "total": 150, "pass": 142, "rate": 94.67},
-                            {"supplier": "示例供应商B", "code": "SUP002",
-                             "total": 120, "pass": 115, "rate": 95.83}
-                        ]
-                        result["data"]["trace_coverage"] = 80
+                        result["data"]["iqc_pass_rate"] = round(pass_count / total * 100, 2)
+                        result["data"]["iqc_sample_count"] = total
+
+            # 桥接库 TBL_QM_INSPECT_RECORD 不含供应商与批次链路字段：
+            # 供应商质量、追溯覆盖率一律置空并在 data_available 中标记，禁止编造
+            result["data"]["supplier_quality"] = []
+            result["data"]["trace_coverage"] = None
+            result["data"]["data_available"] = {
+                "iqc": bool(result["data"].get("iqc_sample_count")),
+                "supplier_quality": False,
+                "trace_coverage": False,
+            }
+            result["data"]["note"] = (
+                "桥接库不含供应商与批次链路字段，供应商质量与追溯覆盖率不计算；"
+                "来料合格率仅基于已取样的检验记录。"
+            )
 
             result["success"] = True
             logger.info(f"物料追溯查询完成")

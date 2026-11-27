@@ -40,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover
     GRAPHRAG_BASE_URL = "http://175.178.238.31"
     GRAPHRAG_TIMEOUT = 12.0
-    GRAPHRAG_CACHE_TTL = 300
+    GRAPHRAG_CACHE_TTL = 1800
 
 
 def _defect_aliases(name: str) -> List[str]:

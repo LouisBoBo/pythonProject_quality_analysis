@@ -14,21 +14,31 @@ from openpyxl.utils import get_column_letter
 
 
 def _safe_name(s: str, fallback: str = "export") -> str:
+    """文件名片段：仅保留字母/数字/汉字与 -_，防止路径穿越。"""
     raw = (s or fallback).strip() or fallback
-    for ch in '\\/:*?"<>|\n\r\t':
-        raw = raw.replace(ch, "_")
-    return raw[:80]
+    cleaned = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)
+    cleaned = cleaned.strip("._") or fallback
+    return cleaned[:80]
+
+
+def _append_row(ws, row: List[Any]):
+    """追加一行；以 = 开头的字符串强制按文本写入，避免被 Excel 当公式执行。"""
+    ws.append([(x if x is not None else "") for x in row])
+    r = ws.max_row
+    for col, v in enumerate(row, 1):
+        if isinstance(v, str) and v.startswith("="):
+            ws.cell(r, col).data_type = "s"
 
 
 def _write_sheet(ws, headers: List[str], rows: List[List[Any]], title: str = ""):
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(color="FFFFFF", bold=True)
     if title:
-        ws.append([title])
+        _append_row(ws, [title])
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(1, len(headers)))
         ws["A1"].font = Font(bold=True, size=13, color="1F4E79")
-        ws.append([])
-    ws.append(headers)
+        _append_row(ws, [])
+    _append_row(ws, headers)
     header_row = ws.max_row
     for col, _ in enumerate(headers, 1):
         cell = ws.cell(header_row, col)
@@ -36,7 +46,7 @@ def _write_sheet(ws, headers: List[str], rows: List[List[Any]], title: str = "")
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
     for row in rows:
-        ws.append([(x if x is not None else "") for x in row])
+        _append_row(ws, row)
     for col in range(1, len(headers) + 1):
         letter = get_column_letter(col)
         maxlen = len(str(headers[col - 1] or ""))
@@ -72,11 +82,12 @@ def export_module_excel(
 
     if module == "scrap":
         filename = f"Scrap_{part}_{stamp}.xlsx"
+        rate = data.get("scrap_rate")
         default["A1"] = "报废分析导出"
         default["A2"] = f"料号: {extra.get('part') or '全部'}"
         default["A3"] = f"报废PCS: {data.get('total_scrap_pcs')}"
         default["A4"] = f"入库PCS: {data.get('total_in_stock_pcs')}"
-        default["A5"] = f"报废率%: {data.get('scrap_rate')}"
+        default["A5"] = f"报废率%: {'—' if rate is None else rate}"
         default["A6"] = f"周期: {data.get('fiscal_period') or data.get('date_filter') or ''}"
         ws = wb.create_sheet("缺陷TOP")
         _write_sheet(
@@ -84,9 +95,9 @@ def export_module_excel(
             ["缺陷", "工序", "PCS", "占比%"],
             [
                 [
-                    d.get("defect") or d.get("InspectionItem") or d.get("item") or "",
+                    d.get("defect_type") or d.get("defect") or d.get("InspectionItem") or d.get("item") or "",
                     d.get("process") or d.get("InspectionProcess") or "",
-                    d.get("pcs") or d.get("qty") or d.get("count") or 0,
+                    d.get("scrap_pcs") or d.get("pcs") or d.get("qty") or d.get("count") or 0,
                     d.get("ratio") or d.get("pct") or "",
                 ]
                 for d in (data.get("defect_top10") or [])
@@ -99,7 +110,7 @@ def export_module_excel(
             [
                 [
                     p.get("process") or p.get("InspectionProcess") or p.get("name") or "",
-                    p.get("pcs") or p.get("qty") or p.get("count") or 0,
+                    p.get("scrap_pcs") or p.get("pcs") or p.get("qty") or p.get("count") or 0,
                     p.get("ratio") or p.get("pct") or "",
                 ]
                 for p in (data.get("process_scrap") or [])
@@ -111,10 +122,10 @@ def export_module_excel(
             ["周期/日期", "报废PCS", "入库PCS", "报废率%"],
             [
                 [
-                    t.get("period") or t.get("date") or t.get("FiscalPeriod") or "",
-                    t.get("scrap_pcs") or t.get("pcs") or t.get("reject") or 0,
-                    t.get("stock_pcs") or t.get("in_stock") or "",
-                    t.get("scrap_rate") or t.get("rate") or "",
+                    t.get("Day") or t.get("Month") or t.get("period") or t.get("date") or t.get("FiscalPeriod") or "",
+                    t.get("TotalScrap") or t.get("scrap_pcs") or t.get("pcs") or t.get("reject") or 0,
+                    t.get("TotalInStock") or t.get("stock_pcs") or t.get("in_stock") or "",
+                    t.get("ScrapRate") if t.get("ScrapRate") is not None else (t.get("scrap_rate") or t.get("rate") or ""),
                 ]
                 for t in (data.get("monthly_trend") or [])
             ],
@@ -130,11 +141,11 @@ def export_module_excel(
             ["工序", "检验数", "合格", "不合格", "合格率%"],
             [
                 [
-                    p.get("process_name") or "",
+                    p.get("process_name") or p.get("ProcessName") or "",
                     p.get("total") or p.get("count") or 0,
-                    p.get("pass_c") or p.get("pass") or 0,
-                    p.get("ng_c") or p.get("ng") or 0,
-                    p.get("pass_rate") or "",
+                    p.get("pass_count") or p.get("pass_c") or p.get("pass") or 0,
+                    p.get("ng_count") or p.get("ng_c") or p.get("ng") or 0,
+                    p.get("pass_rate") if p.get("pass_rate") is not None else "",
                 ]
                 for p in (data.get("process_rates") or [])
             ],
@@ -145,10 +156,10 @@ def export_module_excel(
             ["日期", "检验数", "合格率%", "不合格率%"],
             [
                 [
-                    d.get("date") or d.get("day") or "",
-                    d.get("total") or d.get("count") or 0,
-                    d.get("pass_rate") or "",
-                    d.get("ng_rate") or "",
+                    d.get("day") or d.get("date") or "",
+                    d.get("inspect_count") or d.get("total") or d.get("count") or 0,
+                    d.get("pass_rate") if d.get("pass_rate") is not None else "",
+                    d.get("ng_rate") if d.get("ng_rate") is not None else "",
                 ]
                 for d in (data.get("daily_trend") or [])
             ],
@@ -242,9 +253,10 @@ def export_module_excel(
         recent = data.get("recent") or []
         if recent and isinstance(recent[0], dict):
             keys = [
-                "complaint_no", "complaint_date", "customer_code", "customer_name",
-                "product_code", "product_name", "category", "status",
-                "copq_amount", "affected_qty", "description",
+                "complaint_no", "complaint_date", "customer_name", "product_code",
+                "product_name", "complaint_type", "severity", "status",
+                "cost_category", "affected_qty", "copq_amount",
+                "problem_description", "assigned_to",
             ]
             present = [k for k in keys if any(k in r for r in recent[:5])] or list(recent[0].keys())[:12]
             _write_sheet(ws3, present, [[r.get(k) for k in present] for r in recent])
@@ -275,7 +287,11 @@ def export_module_excel(
         )
         ws = wb.create_sheet("维度得分")
         scores = score.get("scores") or {}
-        _write_sheet(ws, ["维度", "得分"], [[k, v] for k, v in scores.items()])
+        dim_max = score.get("dim_max") or {}
+        _write_sheet(
+            ws, ["维度", "得分", "满分"],
+            [[k, v if v is not None else "—", dim_max.get(k, "")] for k, v in scores.items()],
+        )
         ws2 = wb.create_sheet("问题清单")
         _write_sheet(
             ws2,
@@ -315,11 +331,15 @@ def export_module_excel(
             ["工序", "良率%", "投入", "不良", "检验数"],
             [
                 [
-                    p.get("process_name") or p.get("name") or "",
-                    p.get("yield") or p.get("pass_rate") or p.get("yield_rate") or "",
+                    p.get("process_name") or p.get("ProcessName") or p.get("name") or "",
+                    p.get("yield") if p.get("yield") is not None else (
+                        p.get("PassRate") if p.get("PassRate") is not None else (
+                            p.get("pass_rate") if p.get("pass_rate") is not None else p.get("yield_rate") or ""
+                        )
+                    ),
                     p.get("input") or p.get("qty") or "",
-                    p.get("defect") or p.get("ng") or "",
-                    p.get("inspect_count") or "",
+                    p.get("NgCount") if p.get("NgCount") is not None else (p.get("defect") or p.get("ng") or ""),
+                    p.get("InspectCount") if p.get("InspectCount") is not None else (p.get("inspect_count") or ""),
                 ]
                 for p in (data.get("process_yield") or [])
             ],
@@ -330,9 +350,9 @@ def export_module_excel(
             ["工序", "不良项", "数量"],
             [
                 [
-                    d.get("process_name") or d.get("process") or "",
-                    d.get("defect") or d.get("item") or d.get("name") or "",
-                    d.get("qty") or d.get("count") or 0,
+                    d.get("process_name") or d.get("ProcessName") or d.get("process") or "",
+                    d.get("DefectItem") or d.get("defect") or d.get("item") or d.get("name") or "",
+                    d.get("DefectCount") if d.get("DefectCount") is not None else (d.get("qty") or d.get("count") or 0),
                 ]
                 for d in (data.get("process_defects") or [])
             ],

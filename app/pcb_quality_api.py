@@ -24,6 +24,8 @@ import hashlib
 import hmac
 import time
 import re
+import uuid
+import difflib
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,6 +57,9 @@ from config.settings import (  # noqa: E402
     VERSION,
     CORS_ORIGIN,
     PROD_ALLOW_BRIDGE,
+    MAX_BODY_BYTES,
+    TRUST_PROXY,
+    ADMIN_ROLES,
     GRAPHRAG_BASE_URL,
     TARGET_SCRAP_RATE,
     WARN_SCRAP_RATE,
@@ -77,6 +82,15 @@ from config.settings import (  # noqa: E402
     SESSION_TTL_SECONDS,
     COOKIE_SECURE_MODE,
     LOGIN_ENTERPRISES,
+    OUTPUT_RETENTION_DAYS,
+)
+from config.process_catalog import (  # noqa: E402
+    STANDARD_PROCESSES,
+    aliases_including_self,
+    catalog_payload as process_catalog_payload,
+    merge_counts_by_process,
+    normalize_process_name,
+    process_sort_key,
 )
 from config.env_profiles import (  # noqa: E402
     ACTIVE_ENV,
@@ -99,6 +113,10 @@ from app.auth_session import (  # noqa: E402
     safe_internal_next,
     session_cookie_header,
 )
+from app.date_window import (  # noqa: E402
+    end_exclusive as _end_exclusive,
+    month_end_inclusive as _month_end_inclusive,
+)
 
 BASE_DIR = PROJECT_ROOT
 DATA_DIR.mkdir(exist_ok=True)
@@ -109,8 +127,15 @@ KB_PATH = KB_V2_PATH
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 _log_handlers: list = [logging.StreamHandler()]
 try:
+    from logging.handlers import RotatingFileHandler
+
     _log_handlers.append(
-        logging.FileHandler(str(LOG_DIR / "pcb_quality_api.log"), encoding="utf-8")
+        RotatingFileHandler(
+            str(LOG_DIR / "pcb_quality_api.log"),
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
     )
 except Exception:
     pass
@@ -122,6 +147,37 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger("PCB_Quality")
+
+
+def _cleanup_output_dir() -> None:
+    """按保留天数清理 output/ 下过期的导出文件（仅 .pdf/.xlsx/.csv）。"""
+    if OUTPUT_RETENTION_DAYS <= 0:
+        return
+    cutoff = time.time() - OUTPUT_RETENTION_DAYS * 86400
+    try:
+        for path in Path(OUTPUT_DIR).iterdir():
+            if path.suffix.lower() not in (".pdf", ".xlsx", ".csv"):
+                continue
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError as e:
+                logger.warning("清理过期导出失败 %s: %s", path.name, e)
+    except OSError as e:
+        logger.warning("扫描导出目录失败: %s", e)
+
+
+def _period_parts(period: Any) -> Optional[tuple[str, str, str]]:
+    """把 YYYY-MM / YYYYMM 统一成 (fiscal_period, year, month)；非法返回 None。"""
+    text = str(period or "").strip()
+    m = re.match(r"^(\d{4})-(\d{2})$", text)
+    if m:
+        return f"{m.group(1)}{m.group(2)}", m.group(1), m.group(2)
+    m = re.match(r"^(\d{4})(\d{2})$", text)
+    if m:
+        return text, m.group(1), m.group(2)
+    return None
+
 
 # ═══════════════════════════════════════════════════
 # JSON编码器
@@ -139,6 +195,252 @@ class SmartEncoder(json.JSONEncoder):
 # ═══════════════════════════════════════════════════
 # 数据库：知识库 + 8D + 预警 + 学习历史
 # ═══════════════════════════════════════════════════
+
+# 关闭校验：占位/未落实措辞（出现即不得关闭、不得回写知识）
+_8D_PLACEHOLDER_MARKS = (
+    "待现场确认", "待现场核实", "待排查", "待制定", "待补充", "待指定",
+    "待点名", "草稿", "示例", "TODO", "XXX",
+)
+_8D_GENERIC_DEFECTS = {"综合不良", "待确认", "未知", "其他", "N/A", "-"}
+
+
+def _8d_defect_identity(d: Any) -> tuple[str, str]:
+    """统一缺陷字段命名（ERP/MES/外部分别用 defect_type/Process/process_name）。"""
+    if not isinstance(d, dict):
+        return "", ""
+    dtype = str(
+        d.get("defect_type") or d.get("DefectType") or d.get("defect_name")
+        or d.get("DefectName") or ""
+    ).strip()
+    proc = str(
+        d.get("process") or d.get("Process") or d.get("process_name")
+        or d.get("ProcessName") or ""
+    ).strip()
+    return dtype, proc
+
+
+def _8d_extract_items(text: Any) -> list[str]:
+    """从 D4/D5 文本抽取人工条目；过滤占位、模板标题和未落实措辞。"""
+    items = []
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("- 完成") or s.startswith("- 责任"):
+            continue
+        if s.startswith("→"):
+            s = s.lstrip("→ ").strip()
+        elif re.match(r"^\d+[\.、]", s):
+            s = re.sub(r"^\d+[\.、]\s*", "", s)
+        elif s.startswith("【确定根因】") or s.startswith("确定根因"):
+            s = re.sub(r"^【?确定根因】?[:：]?\s*", "", s)
+        elif s.startswith("【"):
+            continue
+        else:
+            continue
+        if not s or len(s) < 2:
+            continue
+        if any(m in s for m in _8D_PLACEHOLDER_MARKS) or "□" in s:
+            continue
+        items.append(s)
+    return items
+
+
+def _8d_parse_defects(report: dict) -> list[tuple[str, str]]:
+    """解析报告中可用于回写知识的缺陷（去重、去通用桶、去占位）。"""
+    raw = report.get("defects_json") or "[]"
+    try:
+        defects = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        defects = []
+    out, seen = [], set()
+    for d in defects if isinstance(defects, list) else []:
+        dtype, proc = _8d_defect_identity(d)
+        if not dtype or dtype in _8D_GENERIC_DEFECTS:
+            continue
+        if any(m in dtype for m in _8D_PLACEHOLDER_MARKS):
+            continue
+        key = (dtype, proc)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def validate_8d_closure(report: dict) -> list[str]:
+    """关闭前确定性校验：根因已确认、对策可执行、D6 有实测、D8 全勾选、缺陷可追溯。"""
+    blockers: list[str] = []
+    part = str(report.get("part_number") or "").strip()
+    if not part:
+        blockers.append("缺少料号")
+    elif part.startswith(("QHC-8D-", "8D-")):
+        blockers.append("料号字段填了报告编号")
+    if not str(report.get("problem") or "").strip():
+        blockers.append("缺少问题描述")
+
+    d4 = str(report.get("d4") or "")
+    d5 = str(report.get("d5") or "")
+    d6 = str(report.get("d6") or "")
+    d8 = str(report.get("d8") or "")
+
+    if "确定根因" not in d4:
+        blockers.append("D4 缺少【确定根因】结论")
+    if "□" in d4:
+        blockers.append("D4 根因确认框未勾选")
+    if any(m in d4 for m in ("待现场确认", "待排查", "待确认")):
+        blockers.append("D4 仍含待确认/待排查措辞")
+    if "对策待制定" in d5 or not _8d_extract_items(d5):
+        blockers.append("D5 未填写可执行对策")
+    if any(m in d5 for m in _8D_PLACEHOLDER_MARKS):
+        blockers.append("D5 仍含占位措辞（待制定/待指定/草稿等）")
+    if not ("验收" in d6 or "验证" in d6):
+        blockers.append("D6 缺少验收说明")
+    if re.search(r"未验证|待实测|待回填|未实测|待验证", d6):
+        blockers.append("D6 验收状态仍为未验证/待实测")
+    if not re.search(r"\d+(?:\.\d+)?\s*%", d6):
+        blockers.append("D6 缺少实测数值（良率/报废率百分比）")
+    if not re.search(r"\[[xX√✓]\]|☑", d8):
+        blockers.append("D8 关闭确认项尚未勾选")
+    if re.search(r"\[[ ]?\]", d8) or "□" in d8:
+        blockers.append("D8 存在未勾选的确认项")
+    if not _8d_parse_defects(report):
+        blockers.append("缺陷明细为空或仅为通用占位（无法沉淀可追溯知识）")
+    return blockers
+
+
+# 关闭后再次编辑时，这些字段发生变化就必须重新通过关闭校验
+_8D_CONTENT_FIELDS = (
+    "part_number", "customer", "problem",
+    "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8",
+    "defects_json", "evidence_json",
+)
+
+
+def _8d_content_changed(body: dict, prev: Optional[dict]) -> bool:
+    prev = prev or {}
+    return any(
+        key in body and body.get(key) != prev.get(key)
+        for key in _8D_CONTENT_FIELDS
+    )
+
+
+# ── SPC：控制限/能力/状态重算（确定性纯函数，避免沿用 ERP 里的陈旧快照）──
+_SPC_D2 = {
+    2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326,
+    6: 2.534, 7: 2.704, 8: 2.847, 9: 2.970, 10: 3.078,
+}
+
+
+def _spc_compute(values, subgroup_size=1, subgroup_ids=None,
+                 usl=None, lsl=None, ucl=None, cl=None, lcl=None) -> dict:
+    """由 spc_measurements 原始测值重算控制限、Cp/Cpk 与状态。
+
+    - 失控判定优先用 ERP 已配置的 UCL/CL/LCL；缺失时按测值重算
+      （I-MR: 移动极差均值/1.128；Xbar-R: 子组极差均值/d2）。
+    - 状态：样本 <5 点记 insufficient；任一点越控制限或越规格限记 alert；否则 normal。
+    - Cp/Cpk 始终用当前测值重算，避免沿用过期值。
+    """
+    vals: list[float] = []
+    ids: list[Any] = []
+    for i, v in enumerate(values or []):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        vals.append(fv)
+        ids.append(subgroup_ids[i] if subgroup_ids and i < len(subgroup_ids) else None)
+
+    n_sub = max(1, int(subgroup_size or 1))
+    point_groups: list[list[float]] = []
+    point_ranges: list[Optional[float]] = []
+
+    if n_sub > 1:
+        groups: Dict[Any, list[float]] = {}
+        order: list[Any] = []
+        if len(ids) == len(vals) and any(x is not None for x in ids):
+            for v, gid in zip(vals, ids):
+                key = ("g", gid) if gid is not None else ("s", len(order))
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(v)
+        else:
+            for i in range(0, len(vals), n_sub):
+                key = ("s", i // n_sub)
+                groups[key] = vals[i:i + n_sub]
+                order.append(key)
+        point_groups = [groups[k] for k in order if groups[k]]
+        points = [sum(g) / len(g) for g in point_groups]
+        point_ranges = [(max(g) - min(g)) if len(g) > 1 else 0.0 for g in point_groups]
+        d2 = _SPC_D2.get(min(max(n_sub, 2), 10), _SPC_D2[5])
+        sigma = (sum(point_ranges) / len(point_ranges) / d2) if point_ranges else 0.0
+    else:
+        points = list(vals)
+        point_groups = [[v] for v in vals]
+        point_ranges = [None] * len(points)
+        if len(vals) >= 2:
+            mr = [abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))]
+            sigma = (sum(mr) / len(mr)) / 1.128
+        else:
+            sigma = 0.0
+
+    mean = (sum(points) / len(points)) if points else None
+    if ucl is None or lcl is None or cl is None:
+        limits_source = "recomputed"
+        if mean is None or sigma <= 0:
+            eff_ucl = eff_cl = eff_lcl = None
+        else:
+            se = sigma if n_sub <= 1 else sigma / (n_sub ** 0.5)
+            eff_cl = mean
+            eff_ucl = mean + 3.0 * se
+            eff_lcl = mean - 3.0 * se
+    else:
+        limits_source = "stored"
+        eff_ucl, eff_cl, eff_lcl = float(ucl), float(cl), float(lcl)
+
+    cp = cpk = None
+    if sigma > 0 and mean is not None and usl is not None and lsl is not None:
+        cp = (float(usl) - float(lsl)) / (6.0 * sigma)
+        cpk = min(
+            (float(usl) - mean) / (3.0 * sigma),
+            (mean - float(lsl)) / (3.0 * sigma),
+        )
+
+    ooc = sum(
+        1 for p in points
+        if (eff_ucl is not None and p > eff_ucl) or (eff_lcl is not None and p < eff_lcl)
+    )
+    out_spec = sum(
+        1 for v in vals
+        if (usl is not None and v > float(usl)) or (lsl is not None and v < float(lsl))
+    )
+    if not points:
+        status = None
+    elif len(points) < 5:
+        status = "insufficient"
+    elif ooc > 0 or out_spec > 0:
+        status = "alert"
+    else:
+        status = "normal"
+
+    return {
+        "points": points,
+        "point_groups": point_groups,
+        "point_ranges": point_ranges,
+        "sample_count": len(points),
+        "measurement_count": len(vals),
+        "mean": mean,
+        "sigma": sigma,
+        "ucl": eff_ucl,
+        "cl": eff_cl,
+        "lcl": eff_lcl,
+        "limits_source": limits_source,
+        "cp": cp,
+        "cpk": cpk,
+        "out_of_control": ooc,
+        "out_of_spec": out_spec,
+        "status": status,
+    }
+
 
 class QualityKnowledgeDB:
     """品质知识库数据库（SQLite本地存储；可按环境切换文件，不删除旧库）"""
@@ -168,6 +470,16 @@ class QualityKnowledgeDB:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            # 并发读写（API 线程 + 桥接同步）下降低 database is locked 概率
+            for pragma in (
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=NORMAL",
+                "PRAGMA busy_timeout=5000",
+            ):
+                try:
+                    self._conn.execute(pragma)
+                except sqlite3.Error:
+                    pass
         return self._conn
 
     def _init(self):
@@ -231,24 +543,43 @@ class QualityKnowledgeDB:
             created_at TEXT
         )""")
         # 兼容旧库补列
-        for col, typ in (("data_source", "TEXT DEFAULT ''"), ("evidence", "TEXT DEFAULT ''")):
+        for col, typ in (
+            ("data_source", "TEXT DEFAULT ''"),
+            ("evidence", "TEXT DEFAULT ''"),
+            ("fiscal_period", "TEXT DEFAULT ''"),
+            ("last_seen_at", "TEXT DEFAULT ''"),
+            ("archived", "INTEGER DEFAULT 0"),
+            ("resolved_at", "TEXT DEFAULT ''"),
+        ):
             try:
                 c.execute(f"ALTER TABLE quality_alerts ADD COLUMN {col} {typ}")
             except Exception:
                 pass
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alert_active "
+            "ON quality_alerts(archived, fiscal_period)"
+        )
         for col, typ in (
             ("evidence_json", "TEXT DEFAULT '{}'"),
             ("history_refs_json", "TEXT DEFAULT '[]'"),
             ("knowledge_refs_json", "TEXT DEFAULT '[]'"),
             ("data_policy", "TEXT DEFAULT ''"),
+            ("deleted_at", "TEXT DEFAULT ''"),
+            ("alert_id", "TEXT DEFAULT ''"),
+            ("fiscal_period", "TEXT DEFAULT ''"),
         ):
             try:
                 c.execute(f"ALTER TABLE eightd_reports ADD COLUMN {col} {typ}")
             except Exception:
                 pass
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_8d_active "
+            "ON eightd_reports(status, deleted_at)"
+        )
         for col, typ in (
             ("verified", "INTEGER DEFAULT 0"),
             ("source_8d", "TEXT DEFAULT ''"),
+            ("last_bumped_date", "TEXT DEFAULT ''"),
         ):
             try:
                 c.execute(f"ALTER TABLE defect_patterns ADD COLUMN {col} {typ}")
@@ -292,6 +623,10 @@ class QualityKnowledgeDB:
             applied INTEGER DEFAULT 0,
             created_at TEXT
         )""")
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_learning_daily "
+            "ON learning_history(learn_type, source, created_at)"
+        )
 
         # SPC控制图数据
         c.execute("""CREATE TABLE IF NOT EXISTS spc_charts (
@@ -307,6 +642,21 @@ class QualityKnowledgeDB:
             created_at TEXT,
             updated_at TEXT
         )""")
+
+        # 操作审计（删除/清理/确认/保存/导出/同步等写操作留痕）
+        c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            actor TEXT DEFAULT '',
+            role TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            action TEXT,
+            target TEXT DEFAULT '',
+            detail TEXT DEFAULT ''
+        )""")
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)"
+        )
 
         conn.commit()
         logger.info(f"知识库初始化完成: {self.db_path}")
@@ -344,8 +694,8 @@ class QualityKnowledgeDB:
         sql = f"INSERT INTO eightd_reports ({','.join(cols)}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}"
         self.execute(sql, list(data.values()))
 
-    def get_8d_list(self, part_number=None, status=None, limit=50):
-        conds = ["1=1"]
+    def get_8d_list(self, part_number=None, status=None, limit=50, fiscal_period=None):
+        conds = ["IFNULL(deleted_at,'')=''"]
         params = []
         if part_number:
             conds.append("part_number LIKE ?")
@@ -353,18 +703,41 @@ class QualityKnowledgeDB:
         if status:
             conds.append("status=?")
             params.append(status)
+        if fiscal_period:
+            conds.append("fiscal_period=?")
+            params.append(str(fiscal_period))
         return self.query(f"SELECT * FROM eightd_reports WHERE {' AND '.join(conds)} ORDER BY created_at DESC LIMIT ?", params + [limit])
 
-    def get_8d(self, report_id):
-        return self.query_one("SELECT * FROM eightd_reports WHERE id=?", (report_id,))
+    def get_8d(self, report_id, include_deleted=False):
+        cond = "id=?"
+        if not include_deleted:
+            cond += " AND IFNULL(deleted_at,'')=''"
+        return self.query_one(f"SELECT * FROM eightd_reports WHERE {cond}", (report_id,))
+
+    def find_8d_by_report_no(self, report_no, exclude_id=""):
+        if not (report_no or "").strip():
+            return None
+        return self.query_one(
+            "SELECT id, report_no FROM eightd_reports "
+            "WHERE report_no=? AND id<>? AND IFNULL(deleted_at,'')=''",
+            ((report_no or "").strip(), exclude_id or ""),
+        )
 
     def delete_8d(self, report_id):
-        self.execute("DELETE FROM eightd_reports WHERE id=?", (report_id,))
+        """软删除：保留审计痕迹；列表/历史/导出均排除，删除后释放原报告编号。"""
+        now = datetime.now().isoformat()
+        self.execute(
+            "UPDATE eightd_reports SET deleted_at=?, updated_at=?, "
+            "report_no=CASE WHEN IFNULL(report_no,'')='' THEN '' "
+            "ELSE report_no || ' [已删除:' || ? || ']' END WHERE id=?",
+            (now, now, now[:19], report_id),
+        )
 
     def purge_invalid_8d(self):
         """清理无效/编造稿：无料号、报告号当料号、无缺陷实据、通用模板冒充根因的旧稿"""
         rows = self.query(
-            "SELECT id, part_number, problem, defects_json, d4, d5, data_policy, status FROM eightd_reports"
+            "SELECT id, part_number, problem, defects_json, d4, d5, data_policy, status "
+            "FROM eightd_reports WHERE IFNULL(deleted_at,'')=''"
         )
         purged = []
         template_marks = ("油墨粘度偏高", "调整油墨粘度至规范值", "日常检查/参数管控不到位")
@@ -398,7 +771,8 @@ class QualityKnowledgeDB:
     def find_closed_8d_history(self, part_number=None, defect_types=None, process_names=None, limit=8):
         """仅取已关闭 8D 作为真实历史方案（人工确认后的对策）"""
         rows = self.query(
-            "SELECT * FROM eightd_reports WHERE status='closed' ORDER BY closed_at DESC, updated_at DESC LIMIT 80"
+            "SELECT * FROM eightd_reports WHERE status='closed' "
+            "AND IFNULL(deleted_at,'')='' ORDER BY closed_at DESC, updated_at DESC LIMIT 80"
         )
         defect_types = [str(x).strip() for x in (defect_types or []) if str(x).strip()]
         process_names = [str(x).strip() for x in (process_names or []) if str(x).strip()]
@@ -468,94 +842,184 @@ class QualityKnowledgeDB:
         return out[:limit]
 
     def bump_defect_occurrence(self, defect_type, process_name):
-        """只累计不良出现次数，不写入通用模板根因/对策"""
+        """按自然日累计不良出现次数：同一天多次分析不重复加一。"""
         pid = hashlib.md5(f"{defect_type}|{process_name}".encode()).hexdigest()[:16]
         now = datetime.now().isoformat()
+        today = datetime.now().strftime("%Y-%m-%d")
         existing = self.query_one("SELECT * FROM defect_patterns WHERE id=?", (pid,))
         if existing:
+            if (existing.get("last_bumped_date") or "") == today:
+                return
             self.execute(
-                "UPDATE defect_patterns SET occurrence=occurrence+1, updated_at=? WHERE id=?",
-                (now, pid),
+                "UPDATE defect_patterns SET occurrence=occurrence+1, "
+                "last_bumped_date=?, updated_at=? WHERE id=?",
+                (today, now, pid),
             )
         else:
             self.execute(
-                "INSERT INTO defect_patterns (id,defect_type,process_name,root_causes,solutions,occurrence,effectiveness,verified,source_8d,created_at,updated_at) VALUES (?,?,?,?,?,1,0,0,'',?,?)",
-                (pid, defect_type, process_name, "[]", "[]", now, now),
+                "INSERT INTO defect_patterns (id,defect_type,process_name,root_causes,"
+                "solutions,occurrence,effectiveness,verified,source_8d,"
+                "last_bumped_date,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,1,0,0,'',?,?,?)",
+                (pid, defect_type, process_name, "[]", "[]", today, now, now),
             )
 
-    def promote_8d_knowledge(self, report: dict):
-        """关闭 8D 时，将人工确认的根因/对策写入已验证知识库"""
-        if not report:
-            return 0
-        defects = []
-        try:
-            defects = json.loads(report.get("defects_json") or "[]")
-        except Exception:
-            defects = report.get("defects") or []
-        # 从 d4/d5 抽取「→ 」或编号行作为条目（人工填写内容）
-        def _lines(text):
-            items = []
-            for line in str(text or "").splitlines():
-                s = line.strip()
-                if not s or s.startswith("【") or s.startswith("- 完成") or s.startswith("- 责任"):
-                    continue
-                if s.startswith("→"):
-                    items.append(s.lstrip("→ ").strip())
-                elif re.match(r"^\d+[\.、]", s):
-                    items.append(re.sub(r"^\d+[\.、]\s*", "", s))
-                elif s.startswith("【确定根因】") or s.startswith("确定根因"):
-                    items.append(re.sub(r"^【?确定根因】?[:：]?\s*", "", s))
-            return [x for x in items if x and "待排查" not in x and "待制定" not in x and "草稿" not in x]
+    def merge_duplicate_patterns(self):
+        """合并同一（缺陷类型, 工序）的历史重复行（旧版 verified/非 verified 双主键并存）。
 
-        causes = _lines(report.get("d4"))
-        solutions = _lines(report.get("d5"))
-        if not causes and not solutions:
-            return 0
-        n = 0
-        now = datetime.now().isoformat()
-        seeds = defects[:3] or [{"defect_type": "综合不良", "process": ""}]
-        for d in seeds:
-            dtype = str(d.get("defect_type") or d.get("DefectType") or "综合不良")
-            proc = str(d.get("process") or d.get("Process") or "")
-            pid = hashlib.md5(f"{dtype}|{proc}|verified".encode()).hexdigest()[:16]
+        以自然键 (defect_type, process_name) 归并：occurrence 求和，保留已验证内容与
+        源 8D；幂等，可重复调用。
+        """
+        rows = self.query("SELECT * FROM defect_patterns")
+        groups = {}
+        for r in rows:
+            key = (
+                str(r.get("defect_type") or "").strip(),
+                str(r.get("process_name") or "").strip(),
+            )
+            groups.setdefault(key, []).append(r)
+        merged = 0
+        for (dtype, proc), items in groups.items():
+            if len(items) < 2:
+                continue
+            target_id = hashlib.md5(f"{dtype}|{proc}".encode()).hexdigest()[:16]
+            verified_rows = [r for r in items if int(r.get("verified") or 0) == 1]
+            base = verified_rows[-1] if verified_rows else max(
+                items, key=lambda r: int(r.get("occurrence") or 0)
+            )
+            occurrence = sum(int(r.get("occurrence") or 0) for r in items)
+            verified = 1 if verified_rows else 0
+            source_8d = next(
+                (r.get("source_8d") for r in reversed(verified_rows) if r.get("source_8d")),
+                "",
+            )
+            created = min(
+                (r.get("created_at") or "" for r in items if r.get("created_at")),
+                default="",
+            )
+            updated = max(
+                (r.get("updated_at") or "" for r in items if r.get("updated_at")),
+                default=datetime.now().isoformat(),
+            )
+            last_bumped = max(
+                (r.get("last_bumped_date") or "" for r in items), default=""
+            )
+            self.execute("DELETE FROM defect_patterns WHERE id<>? AND defect_type=? AND process_name=?",
+                         (target_id, dtype, proc))
             self.execute(
                 """INSERT INTO defect_patterns
-                   (id,defect_type,process_name,root_causes,solutions,occurrence,effectiveness,verified,source_8d,created_at,updated_at)
-                   VALUES (?,?,?,?,?,1,1.0,1,?,?,?)
+                   (id,defect_type,process_name,root_causes,solutions,occurrence,
+                    effectiveness,verified,source_8d,last_bumped_date,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                      root_causes=excluded.root_causes,
                      solutions=excluded.solutions,
-                     effectiveness=1.0,
-                     verified=1,
+                     occurrence=excluded.occurrence,
+                     effectiveness=excluded.effectiveness,
+                     verified=excluded.verified,
                      source_8d=excluded.source_8d,
-                     occurrence=occurrence+1,
+                     last_bumped_date=excluded.last_bumped_date,
                      updated_at=excluded.updated_at""",
                 (
-                    pid, dtype, proc,
-                    json.dumps(causes[:8], ensure_ascii=False),
-                    json.dumps(solutions[:8], ensure_ascii=False),
-                    report.get("report_no") or report.get("id") or "",
-                    now, now,
+                    target_id, dtype, proc,
+                    base.get("root_causes") or "[]",
+                    base.get("solutions") or "[]",
+                    occurrence,
+                    float(base.get("effectiveness") or 0.0),
+                    verified,
+                    source_8d,
+                    last_bumped,
+                    created or datetime.now().isoformat(),
+                    updated,
                 ),
             )
-            n += 1
-        return n
+            merged += 1
+        return merged
+
+    def promote_8d_knowledge(self, report: dict):
+        """关闭 8D 时，将人工确认的根因/对策写入已验证知识库。
+
+        仅沉淀可追溯缺陷（逐条 exact match），不写通用占位桶；调用方须先通过
+        validate_8d_closure 且仅在 open→closed 迁移时调用，避免重复累计 occurrence。
+        主键与 bump_defect_occurrence 使用同一自然键，保证「出现次数」与「已验证知识」
+        落在同一行，不再产生 verified/非 verified 双行。
+        """
+        if not report:
+            return 0
+        causes = _8d_extract_items(report.get("d4"))
+        solutions = _8d_extract_items(report.get("d5"))
+        if not causes and not solutions:
+            return 0
+        seeds = _8d_parse_defects(report)[:3]
+        if not seeds:
+            return 0
+        self.merge_duplicate_patterns()
+        rows = []
+        now = datetime.now().isoformat()
+        causes_json = json.dumps(causes[:8], ensure_ascii=False)
+        solutions_json = json.dumps(solutions[:8], ensure_ascii=False)
+        source_8d = report.get("report_no") or report.get("id") or ""
+        for dtype, proc in seeds:
+            pid = hashlib.md5(f"{dtype}|{proc}".encode()).hexdigest()[:16]
+            rows.append((
+                pid, dtype, proc, causes_json, solutions_json,
+                source_8d, now, now,
+            ))
+        if not rows:
+            return 0
+        # 单事务写入：要么全部沉淀成功，要么全部回滚，避免半套知识入库
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executemany(
+                    """INSERT INTO defect_patterns
+                       (id,defect_type,process_name,root_causes,solutions,occurrence,effectiveness,verified,source_8d,created_at,updated_at)
+                       VALUES (?,?,?,?,?,1,1.0,1,?,?,?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         root_causes=excluded.root_causes,
+                         solutions=excluded.solutions,
+                         effectiveness=1.0,
+                         verified=1,
+                         source_8d=excluded.source_8d,
+                         occurrence=occurrence+1,
+                         updated_at=excluded.updated_at""",
+                    rows,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return len(rows)
 
     # ── 预警 ─────────────────────────
     def save_alert(self, data: dict):
-        """写入预警；若已确认则保留确认状态，仅刷新指标与文案。"""
-        data.setdefault("created_at", datetime.now().isoformat())
+        """写入预警（同 id 为同一问题的持续状态）。
+
+        created_at = 首次发现时间（永不覆盖）；last_seen_at = 最近一次仍触发的扫描时间；
+        已确认状态保留；问题复发时解除归档，但不重复要求确认。
+        """
+        now = datetime.now().isoformat()
+        data.setdefault("created_at", now)
+        data.setdefault("last_seen_at", now)
+        data.setdefault("fiscal_period", "")
         existing = self.query_one(
             "SELECT acknowledged, ack_by, ack_at, created_at FROM quality_alerts WHERE id=?",
             (data.get("id"),),
         )
-        if existing and int(existing.get("acknowledged") or 0) == 1:
-            data["acknowledged"] = 1
-            data["ack_by"] = existing.get("ack_by") or ""
-            data["ack_at"] = existing.get("ack_at") or ""
+        if existing:
             data["created_at"] = existing.get("created_at") or data["created_at"]
+            if int(existing.get("acknowledged") or 0) == 1:
+                data["acknowledged"] = 1
+                data["ack_by"] = existing.get("ack_by") or ""
+                data["ack_at"] = existing.get("ack_at") or ""
+            else:
+                data.setdefault("acknowledged", 0)
+            data["archived"] = 0
+            data["resolved_at"] = ""
         else:
             data.setdefault("acknowledged", 0)
+            data.setdefault("archived", 0)
         cols = list(data.keys())
         placeholders = ",".join(["?"] * len(cols))
         # 不覆盖 id；已确认时 acknowledged/ack_* 已在 data 中保留
@@ -563,9 +1027,19 @@ class QualityKnowledgeDB:
         sql = f"INSERT INTO quality_alerts ({','.join(cols)}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}"
         self.execute(sql, list(data.values()))
 
-    def get_alerts(self, acknowledged=None, alert_type=None, level=None, limit=100):
-        conds = ["1=1"]
+    def get_alerts(self, acknowledged=None, alert_type=None, level=None, limit=100,
+                   include_archived=False, fiscal_period=None):
+        conds = ["1=1"] if include_archived else ["IFNULL(archived,0)=0"]
         params = []
+        if fiscal_period:
+            fp = str(fiscal_period).strip()
+            if re.match(r"^\d{4}-?\d{2}$", fp):
+                fp = fp.replace("-", "")
+                ym = f"{fp[:4]}-{fp[4:6]}"
+                conds.append(
+                    "(fiscal_period=? OR (IFNULL(fiscal_period,'')='' AND created_at LIKE ?))"
+                )
+                params.extend([fp, f"{ym}%"])
         if acknowledged is not None:
             conds.append("acknowledged=?")
             params.append(1 if acknowledged else 0)
@@ -578,6 +1052,16 @@ class QualityKnowledgeDB:
         return self.query(
             f"SELECT * FROM quality_alerts WHERE {' AND '.join(conds)} ORDER BY created_at DESC LIMIT ?",
             params + [limit],
+        )
+
+    def get_alert(self, alert_id, include_archived=True):
+        if not (alert_id or "").strip():
+            return None
+        cond = "id=?"
+        if not include_archived:
+            cond += " AND IFNULL(archived,0)=0"
+        return self.query_one(
+            f"SELECT * FROM quality_alerts WHERE {cond}", (alert_id.strip(),)
         )
 
     def ack_alert(self, alert_id, ack_by="User"):
@@ -623,24 +1107,52 @@ class QualityKnowledgeDB:
         return removed
 
     def purge_stale_alerts(self, fiscal_period=None):
-        """删除非当月预警，避免 4 月等历史记录混入当前列表。"""
-        if not fiscal_period:
-            fiscal_period = datetime.now().strftime("%Y%m")
-        ym = f"{fiscal_period[:4]}-{fiscal_period[4:6]}"
+        """归档旧版「按天生成」的预警 id（不再删除，保留审计历史）。
+
+        旧 id 形如 ALERT_<part>_SCRAP_20261126，每天一条且确认状态无法延续；
+        新方案为稳定指纹（不含日期），旧行归档后由重新扫描生成稳定记录。
+        """
         removed = []
-        for a in self.get_alerts(limit=500):
+        for a in self.get_alerts(limit=500, include_archived=False):
             aid = a.get("id") or ""
-            created = str(a.get("created_at") or "")
-            stale = False
-            if created and len(created) >= 7 and not created.startswith(ym):
-                stale = True
-            m = re.search(r"_(\d{8})$", aid)
-            if m and m.group(1)[:6] != fiscal_period:
-                stale = True
-            if stale and aid:
-                self.delete_alert(aid)
+            if aid and re.search(r"_\d{8}$", aid) and not re.search(r"_\d{8}_", aid):
+                self.execute(
+                    "UPDATE quality_alerts SET archived=1, resolved_at=? WHERE id=?",
+                    (datetime.now().isoformat(), aid),
+                )
                 removed.append(aid)
         return removed
+
+    def resolve_missing_alerts(self, fiscal_period, keep_ids, scopes=None):
+        """本期扫描未再触发的自动预警 → 归档（问题已不再成立），保留历史与确认记录。
+
+        scopes 限定本次真正扫描过的料号（含「全厂」），避免把未扫描料号的历史预警误归档。
+        """
+        keep = set(keep_ids or [])
+        conds = [
+            "IFNULL(archived,0)=0",
+            "auto_generated=1",
+            "fiscal_period=?",
+        ]
+        params = [str(fiscal_period or "")]
+        if scopes:
+            uniq = sorted({str(s) for s in scopes if str(s).strip()})
+            conds.append("part_number IN (" + ",".join(["?"] * len(uniq)) + ")")
+            params.extend(uniq)
+        rows = self.query(
+            f"SELECT id FROM quality_alerts WHERE {' AND '.join(conds)}", params
+        )
+        now = datetime.now().isoformat()
+        resolved = []
+        for r in rows:
+            aid = r.get("id") or ""
+            if aid and aid not in keep:
+                self.execute(
+                    "UPDATE quality_alerts SET archived=1, resolved_at=? WHERE id=?",
+                    (now, aid),
+                )
+                resolved.append(aid)
+        return resolved
 
     # ── 知识/学习 ────────────────────
     def add_learning(self, learn_type, source, content, insight="", confidence=0.5):
@@ -648,11 +1160,47 @@ class QualityKnowledgeDB:
                         VALUES (?,?,?,?,?,?)""",
                      (learn_type, source, content, insight, confidence, datetime.now().isoformat()))
 
+    def add_learning_once(self, learn_type, source, content, insight="", confidence=0.5):
+        """同一学习类型+来源每天最多记一条（原子 upsert，避免并发重复写入膨胀历史表）。"""
+        day = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now().isoformat()
+        cur = self.execute(
+            "INSERT INTO learning_history (learn_type,source,content,insight,confidence,created_at) "
+            "SELECT ?,?,?,?,?,? WHERE NOT EXISTS ("
+            "  SELECT 1 FROM learning_history "
+            "  WHERE learn_type=? AND source=? AND substr(created_at,1,10)=?"
+            ")",
+            (learn_type, source, content, insight, confidence, now,
+             learn_type, source, day),
+        )
+        return (cur.rowcount or 0) > 0
+
+    def log_audit(self, actor, role, ip, action, target="", detail=""):
+        """写一条操作审计；失败不影响主流程。"""
+        try:
+            self.execute(
+                "INSERT INTO audit_log (ts,actor,role,ip,action,target,detail) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    datetime.now().isoformat(timespec="seconds"),
+                    str(actor or "")[:120],
+                    str(role or "")[:120],
+                    str(ip or "")[:64],
+                    str(action or "")[:80],
+                    str(target or "")[:200],
+                    str(detail or "")[:2000],
+                ),
+            )
+        except Exception as e:
+            logger.warning("审计日志写入失败: %s", e)
+
     def get_learning_stats(self):
         total = self.query_one("SELECT COUNT(*) as c FROM learning_history")["c"]
         applied = self.query_one("SELECT COUNT(*) as c FROM learning_history WHERE applied=1")["c"]
         patterns = self.query_one("SELECT COUNT(*) as c FROM defect_patterns")["c"]
-        reports_8d = self.query_one("SELECT COUNT(*) as c FROM eightd_reports")["c"]
+        reports_8d = self.query_one(
+            "SELECT COUNT(*) as c FROM eightd_reports WHERE IFNULL(deleted_at,'')=''"
+        )["c"]
         alerts = self.query_one("SELECT COUNT(*) as c FROM quality_alerts")["c"]
         return {"total_learning": total, "applied_learning": applied,
                 "defect_patterns": patterns, "reports_8d": reports_8d, "alerts_total": alerts}
@@ -844,7 +1392,7 @@ class SelfLearningEngine:
 
             self.db.bump_defect_occurrence(defect_type, process)
             insight = f"累计不良频次：{process}-{defect_type}（本期 {scrap_pcs} PCS，来源 ERP）"
-            self.db.add_learning(
+            self.db.add_learning_once(
                 "defect_occurrence",
                 f"{process}/{defect_type}",
                 f"scrap_pcs={scrap_pcs}",
@@ -865,16 +1413,22 @@ class SelfLearningEngine:
 
     def generate_alerts(self, scrap_rate: float, part_number: str,
                         process_data: list, monthly_trend: list,
-                        scrap_pcs: float = 0, persist: bool = True) -> list:
-        """智能生成预警（可落库）"""
+                        scrap_pcs: float = 0, persist: bool = True,
+                        fiscal_period: str = "") -> list:
+        """智能生成预警（可落库）。scrap_rate=None 表示无入库基数、口径不可靠，禁止据此报警。
+
+        预警 id = 料号 + 周期 + 类型(+工序) 的稳定指纹，不含扫描日期：
+        同一问题每天扫描只刷新指标/最近触发时间，确认状态与首次发现时间得以保留。
+        """
         alerts = []
         now = datetime.now().isoformat()
-        day = datetime.now().strftime('%Y%m%d')
+        fp = str(fiscal_period or "").strip().replace("-", "")
+        fp_key = fp or "ALL"
         part_key = (part_number or "全厂").replace(" ", "")[:32]
 
-        # 1. 报废率预警：必须有 ERP 报废实数，样本过小不报
-        if scrap_rate > self.ALERT_SCRAP_WARN and scrap_pcs >= 50:
-            aid = f"ALERT_{part_key}_SCRAP_{day}"
+        # 1. 报废率预警：必须有可靠报废率（报废+入库基数）+ 报废实数，样本过小不报
+        if scrap_rate is not None and scrap_rate > self.ALERT_SCRAP_WARN and scrap_pcs >= 50:
+            aid = f"ALERT_{part_key}_{fp_key}_SCRAP"
             level = "critical" if scrap_rate > self.ALERT_SCRAP_CRIT else "warning"
             alert = {
                 "id": aid,
@@ -892,6 +1446,8 @@ class SelfLearningEngine:
                 "evidence": f"scrap_pcs={int(scrap_pcs)},scrap_rate={scrap_rate}",
                 "auto_generated": 1,
                 "acknowledged": 0,
+                "fiscal_period": fp,
+                "last_seen_at": now,
                 "created_at": now,
             }
             if persist:
@@ -900,7 +1456,10 @@ class SelfLearningEngine:
 
         # 2. 工序良率预警：必须来自 MES 检验实数，且检验笔数达标
         for p in (process_data or []):
-            rate = float(p.get("PassRate", p.get("yield_rate", 100)) or 100)
+            raw_rate = p.get("PassRate", p.get("yield_rate"))
+            if raw_rate is None:
+                continue
+            rate = float(raw_rate)
             pname = str(p.get("ProcessName", p.get("process_name", "")) or "")
             inspect_n = int(p.get("InspectCount", p.get("total_qty", 0)) or 0)
             if not pname or rate >= self.ALERT_YIELD_WARN:
@@ -908,7 +1467,7 @@ class SelfLearningEngine:
             if inspect_n < self.ALERT_MIN_INSPECT:
                 continue  # 样本不足，禁止生成（避免包装 0%/焊接 50% 低样本误报）
             safe_pn = re.sub(r"[^\w\u4e00-\u9fff\-]", "_", pname)[:24]
-            aid = f"ALERT_{part_key}_{safe_pn}_YIELD_{day}"
+            aid = f"ALERT_{part_key}_{fp_key}_{safe_pn}_YIELD"
             gr_tips = []
             try:
                 gr_tips = get_graphrag_client().suggest_for_process(pname, max_items=2)
@@ -933,51 +1492,67 @@ class SelfLearningEngine:
                 "evidence": f"process={pname},inspect={inspect_n},pass_rate={rate},graphrag_tips={len(gr_tips)}",
                 "auto_generated": 1,
                 "acknowledged": 0,
+                "fiscal_period": fp,
+                "last_seen_at": now,
                 "created_at": now,
             }
             if persist:
                 self.db.save_alert(alert)
             alerts.append(alert)
 
-        # 3. 趋势恶化：两期均需有有效报废率（禁止 0%→跳变），取自 ERP 日/月趋势实数
+        # 3. 趋势恶化：两期均需有有效报废率（禁止 0%→跳变），且只用「已结束的自然日」
         if monthly_trend and len(monthly_trend) >= 2:
+            today = datetime.now().strftime("%Y-%m-%d")
+            complete = [
+                x for x in monthly_trend
+                if str(x.get("Day") or x.get("Month") or x.get("month") or "")[:10] < today
+            ]
             sorted_trend = sorted(
-                monthly_trend,
+                complete,
                 key=lambda x: str(x.get("Day") or x.get("Month") or x.get("month") or ""),
             )
-            last = sorted_trend[-1]
-            prev = sorted_trend[-2]
-            last_rate = float(last.get("ScrapRate", last.get("scrap_rate", 0)) or 0)
-            prev_rate = float(prev.get("ScrapRate", prev.get("scrap_rate", 0)) or 0)
-            last_pcs = float(last.get("TotalScrap", last.get("scrap_pcs", 0)) or 0)
-            prev_pcs = float(prev.get("TotalScrap", prev.get("scrap_pcs", 0)) or 0)
-            if (
-                prev_rate > 0
-                and last_rate > prev_rate * 1.2
-                and last_rate > 3
-                and last_pcs >= 50
-                and prev_pcs >= 20
-            ):
-                aid = f"ALERT_{part_key}_TREND_{day}"
-                alert = {
-                    "id": aid,
-                    "alert_type": "trend_deterioration",
-                    "level": "critical" if last_rate > self.ALERT_SCRAP_CRIT else "warning",
-                    "part_number": part_number or "全厂",
-                    "process_name": "",
-                    "message": f"报废率上升趋势（{prev_rate:.2f}%→{last_rate:.2f}%），需关注",
-                    "metric_value": last_rate,
-                    "threshold": prev_rate,
-                    "suggestion": "建议对比两期工艺/物料批次变化，追查根因并复核首件",
-                    "data_source": "ERP:View_P_Inspection日趋势",
-                    "evidence": f"prev={prev_rate}%/{int(prev_pcs)}pcs,last={last_rate}%/{int(last_pcs)}pcs",
-                    "auto_generated": 1,
-                    "acknowledged": 0,
-                    "created_at": now,
-                }
-                if persist:
-                    self.db.save_alert(alert)
-                alerts.append(alert)
+            if len(sorted_trend) >= 2:
+                last = sorted_trend[-1]
+                prev = sorted_trend[-2]
+                last_raw = last.get("ScrapRate", last.get("scrap_rate"))
+                prev_raw = prev.get("ScrapRate", prev.get("scrap_rate"))
+                last_pcs = float(last.get("TotalScrap", last.get("scrap_pcs", 0)) or 0)
+                prev_pcs = float(prev.get("TotalScrap", prev.get("scrap_pcs", 0)) or 0)
+                # 任一期无入库基数（None）不判趋势，避免 0→有数 或 无基数→100% 的伪恶化
+                if (
+                    last_raw is not None
+                    and prev_raw is not None
+                    and float(prev_raw) > 0
+                    and float(last_raw) > float(prev_raw) * 1.2
+                    and float(last_raw) > 3
+                    and last_pcs >= 50
+                    and prev_pcs >= 20
+                ):
+                    last_rate = float(last_raw)
+                    prev_rate = float(prev_raw)
+                    aid = f"ALERT_{part_key}_{fp_key}_TREND"
+                    alert = {
+                        "id": aid,
+                        "alert_type": "trend_deterioration",
+                        "level": "critical" if last_rate > self.ALERT_SCRAP_CRIT else "warning",
+                        "part_number": part_number or "全厂",
+                        "process_name": "",
+                        "message": f"报废率上升趋势（{prev_rate:.2f}%→{last_rate:.2f}%），需关注",
+                        "metric_value": last_rate,
+                        "threshold": prev_rate,
+                        "suggestion": "建议对比两期工艺/物料批次变化，追查根因并复核首件",
+                        "data_source": "ERP:View_P_Inspection日趋势",
+                        "evidence": f"prev={prev_rate}%/{int(prev_pcs)}pcs,last={last_rate}%/{int(last_pcs)}pcs,"
+                                    f"days={last.get('Day') or ''}",
+                        "auto_generated": 1,
+                        "acknowledged": 0,
+                        "fiscal_period": fp,
+                        "last_seen_at": now,
+                        "created_at": now,
+                    }
+                    if persist:
+                        self.db.save_alert(alert)
+                    alerts.append(alert)
 
         return alerts
 
@@ -1021,7 +1596,11 @@ class SelfLearningEngine:
             raw += scores["scrap"]
         else:
             scores["scrap"] = None
-            data_gaps.append("报废：本期无 ERP 报废/入库实测，请在 ERP 补充检验报废与生产入库")
+            data_gaps.append(
+                "报废：本期有报废但缺入库基数，报废率不计分"
+                if has_scrap else
+                "报废：本期无 ERP 报废/入库实测，请在 ERP 补充检验报废与生产入库"
+            )
 
         # 2. 检验 + 3. 过程（MES 工序良率）
         if has_mes and avg_yield is not None and min_yield is not None:
@@ -1153,7 +1732,10 @@ class SelfLearningEngine:
         # report_no 含时分秒，避免同料号同日 UNIQUE 冲突
         report_no = f"QHC-8D-{ts}-{hashlib.md5(safe_part.encode()).hexdigest()[:4].upper()}"
 
-        scrap_rate = float(evidence.get("scrap_rate") or 0)
+        rate_reliable = bool(evidence.get("rate_reliable", evidence.get("scrap_rate") is not None))
+        scrap_rate = float(evidence.get("scrap_rate") or 0) if rate_reliable else 0.0
+        # 无入库基数时不在正文写「0.00%」或「100%」，明确标注口径不可用
+        scrap_rate_text = f"{scrap_rate:.2f}%" if rate_reliable else "—（缺入库基数，不计算）"
         scrap_pcs = int(evidence.get("scrap_pcs") or 0)
         stock_pcs = int(evidence.get("stock_pcs") or 0)
         fiscal = evidence.get("fiscal_period") or ""
@@ -1326,7 +1908,7 @@ class SelfLearningEngine:
         d4_parts.append(
             "一、数据定位（ERP/MES 实据，非推测）\n"
             f"- 料号：{part_number}｜周期：{fiscal or evidence.get('date_range') or '—'}\n"
-            f"- 报废率：{scrap_rate:.2f}%（报废 {scrap_pcs} PCS / 入库 {stock_pcs} PCS）\n"
+            f"- 报废率：{scrap_rate_text}（报废 {scrap_pcs} PCS / 入库 {stock_pcs} PCS）\n"
             f"- 缺陷帕累托（ERP 原名）：{defect_desc}\n"
             f"- 工序集中度：主责「{primary_process or '—'}」占报废 "
             f"{primary_ratio:.1f}%"
@@ -1400,7 +1982,7 @@ class SelfLearningEngine:
         section_why = "五" if hist_cause_lines else "四"
         d4_parts.append(
             f"{section_why}、5Why（数据驱动假设链 · 每步须留证据）\n"
-            f"Why1：为何报废率达 {scrap_rate:.2f}%？\n"
+            f"Why1：为何报废率达 {scrap_rate_text}？\n"
             f"  → 因「{top1}」等不良集中，TOP1 占 {top1_ratio:.1f}%；"
             f"工序「{primary_process or '—'}」占报废 {primary_ratio:.1f}%（ERP）。\n"
             f"Why2：为何 {primary_process or '该工序'} 输出 {top1}？\n"
@@ -1458,7 +2040,7 @@ class SelfLearningEngine:
         d5_parts.append(
             "三、实施与验收计划\n"
             f"- 总体完成时限：{deadline}\n"
-            f"- 验收基线：报废率 {scrap_rate:.2f}%（报废 {scrap_pcs} / 入库 {stock_pcs}）"
+            f"- 验收基线：报废率 {scrap_rate_text}（报废 {scrap_pcs} / 入库 {stock_pcs}）"
             f"{(' · ' + fiscal) if fiscal else ''}\n"
             f"- 验收目标：连续 3 批报废率 ≤ 2.0%，且「{primary_process or '主责工序'}」"
             "相关不良占比显著下降\n"
@@ -1470,7 +2052,7 @@ class SelfLearningEngine:
         target_scrap = 2.0
         d6 = (
             "【验证方案（对照本单 ERP/MES 基线，验证结果待实测回填）】\n"
-            f"1. 基线报废率 {scrap_rate:.2f}%（报废 {scrap_pcs} / 入库 {stock_pcs} PCS）"
+            f"1. 基线报废率 {scrap_rate_text}（报废 {scrap_pcs} / 入库 {stock_pcs} PCS）"
             f"{' · 周期 ' + fiscal if fiscal else ''}\n"
             f"2. 目标：连续 3 个生产批次报废率 ≤ {target_scrap:.1f}%（或较基线下降 ≥50%）\n"
             f"3. 主责工序「{top_process or '相关工序'}」首件/巡检加严，并回写 MES 检验实绩\n"
@@ -1479,7 +2061,7 @@ class SelfLearningEngine:
         )
 
         problem = (
-            f"料号{part_number}品质异常：报废率{scrap_rate:.2f}%"
+            f"料号{part_number}品质异常：报废率{scrap_rate_text}"
             f"（报废{scrap_pcs}PCS/入库{stock_pcs}PCS）"
             f"{('，周期'+fiscal) if fiscal else ''}，主要不良：{defect_desc}"
         )
@@ -1503,7 +2085,7 @@ class SelfLearningEngine:
                 f"【问题描述 · ERP/MES 实据】\n"
                 f"【产品】料号：{part_number}\n"
                 f"【周期】{fiscal or evidence.get('date_range') or '见查询条件'}\n"
-                f"【现象】报废率 {scrap_rate:.2f}% = 报废 {scrap_pcs} / (报废+入库 {scrap_pcs + stock_pcs}) PCS\n"
+                f"【现象】报废率 {scrap_rate_text} = 报废 {scrap_pcs} / (报废+入库 {scrap_pcs + stock_pcs}) PCS\n"
                 f"【主要不良 TOP】{defect_desc}\n"
                 f"【主责工序线索】{top_process or '—'}\n"
                 f"【关联工单】{wo_line}\n"
@@ -1555,7 +2137,11 @@ class SelfLearningEngine:
                 "no_template_as_fact"
             ),
             "status": "open",
-            "severity": 5 if scrap_rate >= 10 else (4 if scrap_rate >= 5 else 3),
+            "severity": (
+                5 if (rate_reliable and scrap_rate >= 10)
+                else 4 if ((rate_reliable and scrap_rate >= 5) or scrap_pcs >= 500)
+                else 3
+            ),
             "created_by": "系统·实据+知识库",
             "created_at": datetime.now().isoformat(),
             "history_count": len(hist_refs),
@@ -1583,11 +2169,11 @@ class SelfLearningEngine:
 
     def generate_recommendations(self, defects: list, process_data: list,
                                   scrap_rate: float, part_number: str) -> list:
-        """生成改善建议列表"""
+        """生成改善建议列表。scrap_rate=None（无入库基数）时不据此给报废建议。"""
         recs = []
 
         # 基于报废率的建议
-        if scrap_rate > 5:
+        if scrap_rate is not None and scrap_rate > 5:
             recs.append({
                 "priority": "P0",
                 "type": "立即行动",
@@ -1596,7 +2182,7 @@ class SelfLearningEngine:
                 "owner": "品质部",
                 "deadline": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             })
-        elif scrap_rate > 2:
+        elif scrap_rate is not None and scrap_rate > 2:
             recs.append({
                 "priority": "P1",
                 "type": "优先处理",
@@ -1861,6 +2447,7 @@ class PCBQualitySystem:
             "total_scrap_pcs": 0,
             "total_in_stock_pcs": 0,   # 真实入库数量（FGI_StockFormItem）
             "scrap_rate": 0,
+            "rate_reliable": False,    # 无入库基数时不计算报废率（scrap_rate=None）
             "defect_top10": [],
             "monthly_trend": [],
             "process_scrap": [],
@@ -1889,59 +2476,65 @@ class PCBQualitySystem:
                 end_date = f"{year}-{month+1:02d}-01"
             result["fiscal_period"] = fiscal_period
             result["date_filter"] = "fiscal_period+stockDate_month"
+            result["end_exclusive"] = end_date
         elif period:
-            year, month = period.split("-")
-            fiscal_period = f"{year}{month}"
+            parts = _period_parts(period)
+            if not parts:
+                return {"success": False, "error": f"周期格式无效：{period}"}
+            fiscal_period = parts[0]
             return self.get_scrap_analysis(
                 part_number, start_date, end_date, period=None, fiscal_period=fiscal_period
             )
         else:
             start_date, end_date = self._get_default_dates(start_date, end_date)
+            # 统一右开区间：用户截止日含当天 → 次日 00:00（唯一转换点）
+            end_date = _end_exclusive(end_date)
             result["date_filter"] = "createDate/stockDate_range"
+            result["end_exclusive"] = end_date
 
         try:
             # 查询条件 - MRB报废包含所有检验类型的报废
-            # ERP日报口径：排除以下非量产性报废
-            # 1. 非生产工序: 样板组/品质部/工艺部/设备部/销售部/测试划线/FQC/FQC2
-            # 2. 非生产项目: 实验板/备品/实验
-            # 3. 测试工序和测试相关检验项目: ERP日报不统计入库前的测试报废
-            non_production_processes = ['样板组', '品质部', '工艺部', '设备部', '销售部', '测试划线', 'FQC', 'FQC(内部客检)', 'FQC2']
-            non_production_items = ['实验板', '备品', '实验']
-            np_proc_list = "', '".join(non_production_processes)
-            np_item_list = "', '".join(non_production_items)
-            insp_conds = [
-                "v.InspectionResult = 'Scrapped'",
-                f"ISNULL(v.InspectionProcess, '') NOT IN ('{np_proc_list}')",
-                f"ISNULL(v.InspectionItem, '') NOT IN ('{np_item_list}')",
-                # 排除测试工序和测试相关检验项目(ERP日报不统计入库前的测试报废)
-                "ISNULL(v.InspectionProcess, '') <> '测试'",
-                # 排除检验项目包含"测试"的记录(如测试擦花/测试板损/测试压伤等)
-                "ISNULL(v.InspectionItem, '') NOT LIKE '%测试%'"
-            ]
-            wo_conds = ["(wo.qty_PCS_PRODUCED > 0 OR wo.reject_PCS > 0)"]
+            # 统一口径（与 get_scrap_trends / COPQ / 仪表板共用一个 SQL 片段）：
+            # 排除非生产工序/项目、测试工序及项目、TEST- 非量产料号
+            insp_conds = [self._scrap_non_production_sql()]
+            wo_conds = ["(wo.qty_PCS_PRODUCED > 0 OR wo.reject_PCS > 0)",
+                        self._scrap_part_excluded_sql("mp.mfgPartCode")]
+            insp_params = []
+            wo_params = []
 
             if part_number:
-                insp_conds.append(f"v.MfgPartCode LIKE '%{part_number}%'")
-                wo_conds.append(f"mp.mfgPartCode LIKE '%{part_number}%'")
+                insp_conds.append("v.MfgPartCode LIKE ?")
+                insp_params.append(f"%{part_number}%")
+                wo_conds.append("mp.mfgPartCode LIKE ?")
+                wo_params.append(f"%{part_number}%")
             
             # 周期过滤：优先使用FiscalPeriod
             if fiscal_period:
-                insp_conds.append(f"v.FiscalPeriod = '{fiscal_period}'")
-                wo_conds.append(f"wo.FiscalPeriod = '{fiscal_period}'")
+                insp_conds.append("v.FiscalPeriod = ?")
+                insp_params.append(fiscal_period)
+                wo_conds.append("wo.FiscalPeriod = ?")
+                wo_params.append(fiscal_period)
             else:
                 # 兼容旧接口：使用日期范围
                 if start_date:
-                    insp_conds.append(f"v.CreateDate >= '{start_date}'")
-                    wo_conds.append(f"wo.createDate >= '{start_date}'")
+                    insp_conds.append("v.CreateDate >= ?")
+                    insp_params.append(start_date)
+                    wo_conds.append("wo.createDate >= ?")
+                    wo_params.append(start_date)
                 if end_date:
-                    insp_conds.append(f"v.CreateDate < '{end_date}'")
-                    wo_conds.append(f"wo.createDate < '{end_date}'")
+                    insp_conds.append("v.CreateDate < ?")
+                    insp_params.append(end_date)
+                    wo_conds.append("wo.createDate < ?")
+                    wo_params.append(end_date)
 
             insp_where = " AND ".join(insp_conds)
             wo_where = " AND ".join(wo_conds)
 
             # 总报废
-            r = self.erp.execute(f"SELECT SUM(v.QtyOfUnit) AS TotalScrap FROM View_P_Inspection v WHERE {insp_where}")
+            r = self.erp.execute(
+                f"SELECT SUM(v.QtyOfUnit) AS TotalScrap FROM View_P_Inspection v WHERE {insp_where}",
+                insp_params,
+            )
             if r.get("success") and r.get("data"):
                 result["total_scrap_pcs"] = int(r["data"][0].get("TotalScrap") or 0)
 
@@ -1949,16 +2542,21 @@ class PCBQualitySystem:
             # FGI_StockFormItemWO.woId → P_WO.recId → E_JobMfgParts.mfgPartCode
             # 关键：FiscalPeriod 模式下必须按 wo.FiscalPeriod 过滤，不能按日历 stockDate。
             # 例：202610 工单的 FGI 常在 11 月初入库，用 stockDate∈10月会得到入库=0。
-            stock_conds = ["1=1"]
+            stock_conds = ["1=1", self._scrap_part_excluded_sql("mp.mfgPartCode")]
+            stock_params = []
             if part_number:
-                stock_conds.append(f"mp.mfgPartCode LIKE '%{part_number}%'")
+                stock_conds.append("mp.mfgPartCode LIKE ?")
+                stock_params.append(f"%{part_number}%")
             if fiscal_period:
-                stock_conds.append(f"wo.FiscalPeriod = '{fiscal_period}'")
+                stock_conds.append("wo.FiscalPeriod = ?")
+                stock_params.append(fiscal_period)
             else:
                 if start_date:
-                    stock_conds.append(f"sfi.stockDate >= '{start_date}'")
+                    stock_conds.append("sfi.stockDate >= ?")
+                    stock_params.append(start_date)
                 if end_date:
-                    stock_conds.append(f"sfi.stockDate < '{end_date}'")
+                    stock_conds.append("sfi.stockDate < ?")
+                    stock_params.append(end_date)
             stock_where = " AND ".join(stock_conds)
 
             r_stock = self.erp.execute(f"""
@@ -1968,20 +2566,38 @@ class PCBQualitySystem:
                 INNER JOIN P_WO wo ON sfiwo.woId = wo.recId
                 INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
                 WHERE {stock_where}
-            """)
+            """, stock_params)
             if r_stock.get("success") and r_stock.get("data"):
                 result["total_in_stock_pcs"] = int(r_stock["data"][0].get("TotalInStock") or 0)
 
-            # 无 FGI 时回退工单产出 PCS（同周期），避免月趋势整段空白；并标记口径
-            if result["total_in_stock_pcs"] <= 0 and fiscal_period:
+            # 无 FGI 时回退工单产出 PCS（同周期/同日期范围），避免月趋势整段空白；并标记口径
+            if result["total_in_stock_pcs"] <= 0:
+                fallback_params = []
+                if fiscal_period:
+                    wo_time_cond = "wo.FiscalPeriod = ?"
+                    fallback_params.append(fiscal_period)
+                else:
+                    _wc = []
+                    if start_date:
+                        _wc.append("wo.createDate >= ?")
+                        fallback_params.append(start_date)
+                    if end_date:
+                        _wc.append("wo.createDate < ?")
+                        fallback_params.append(end_date)
+                    wo_time_cond = " AND ".join(_wc) or "1=1"
+                part_cond_wo = ""
+                if part_number:
+                    part_cond_wo = "AND mp.mfgPartCode LIKE ?"
+                    fallback_params.append(f"%{part_number}%")
                 r_wo_qty = self.erp.execute(f"""
                     SELECT SUM(wo.qty_PCS_PRODUCED) AS Produced
                     FROM P_WO wo
                     INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
-                    WHERE wo.FiscalPeriod = '{fiscal_period}'
+                    WHERE {wo_time_cond}
                       AND (wo.qty_PCS_PRODUCED > 0 OR wo.reject_PCS > 0)
-                      {f"AND mp.mfgPartCode LIKE '%{part_number}%'" if part_number else ""}
-                """)
+                      AND {self._scrap_part_excluded_sql('mp.mfgPartCode')}
+                      {part_cond_wo}
+                """, fallback_params)
                 if r_wo_qty.get("success") and r_wo_qty.get("data"):
                     produced = int(r_wo_qty["data"][0].get("Produced") or 0)
                     if produced > 0:
@@ -1989,7 +2605,7 @@ class PCBQualitySystem:
                         result["stock_source"] = "P_WO.qty_PCS_PRODUCED"
                         result["data_gap"] = (result.get("data_gap") or "") + \
                             ("；" if result.get("data_gap") else "") + \
-                            "本期无 FGI 入库记录，入库口径回退为工单产出 PCS"
+                            "本期无 FGI 入库记录，入库口径回退为工单产出 PCS（近似）"
                     else:
                         result["stock_source"] = "none"
                 else:
@@ -1997,18 +2613,19 @@ class PCBQualitySystem:
             elif result["total_in_stock_pcs"] > 0:
                 result["stock_source"] = "FGI_StockFormItemWO"
 
-            # 报废率 = 报废/(报废+入库)；仅报废无入库→100%；皆无→0 并标记无投入基数
+            # 报废率 = 报废/(报废+入库)；无入库基数→不计算（None），避免 100% 误导
             scrap_pcs = result["total_scrap_pcs"]
             stock_pcs = result["total_in_stock_pcs"]
             input_base = scrap_pcs + stock_pcs
             result["input_base_pcs"] = input_base
-            if input_base > 0:
+            result["rate_reliable"] = bool(stock_pcs > 0 and input_base > 0)
+            if result["rate_reliable"]:
                 result["scrap_rate"] = round(scrap_pcs * 100.0 / input_base, 2)
                 result["has_data"] = True
             elif scrap_pcs > 0:
-                result["scrap_rate"] = 100.0
+                result["scrap_rate"] = None
                 result["has_data"] = True
-                result["data_gap"] = "有报废但无入库 PCS，请在 ERP 补充 FGI 生产入库"
+                result["data_gap"] = "有报废但无 FGI/工单入库基数，报废率不计算（请在 ERP 补充生产入库）"
             else:
                 result["scrap_rate"] = 0
                 result["has_data"] = False
@@ -2024,7 +2641,7 @@ class PCBQualitySystem:
                 WHERE {insp_where}
                 GROUP BY v.InspectionItem, v.InspectionProcess
                 ORDER BY SUM(v.QtyOfUnit) DESC
-            """)
+            """, insp_params)
             if r.get("success") and r.get("data"):
                 total = result["total_scrap_pcs"] or 1
                 for row in r["data"]:
@@ -2045,7 +2662,7 @@ class PCBQualitySystem:
                 WHERE {insp_where}
                 GROUP BY CONVERT(VARCHAR(10), v.CreateDate, 120)
                 ORDER BY Day DESC
-            """)
+            """, insp_params)
             if r.get("success") and r.get("data"):
                 # 每日入库（FGI_StockFormItemWO 通过工单关联）
                 r2 = self.erp.execute(f"""
@@ -2057,7 +2674,7 @@ class PCBQualitySystem:
                     INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
                     WHERE {stock_where}
                     GROUP BY CONVERT(VARCHAR(10), sfi.stockDate, 120)
-                """)
+                """, stock_params)
                 inp_map = {}
                 if r2.get("success") and r2.get("data"):
                     for row in r2["data"]:
@@ -2076,31 +2693,43 @@ class PCBQualitySystem:
                 for d in sorted(day_set)[-62:]:
                     sc = scrap_map.get(d, 0)
                     inp = inp_map.get(d, 0)
-                    rate = round(sc * 100.0 / (sc + inp), 2) if (sc + inp) > 0 else 0
+                    # 当日无入库基数时不给率（None），与 get_scrap_trends 一致
+                    rate = round(sc * 100.0 / (sc + inp), 2) if inp > 0 else None
                     result["monthly_trend"].append({
                         "Day": d, "Month": d,  # Month 兼容旧前端字段
                         "TotalScrap": sc,
                         "TotalInStock": inp, "ScrapRate": rate
                     })
 
-            # 按工序汇总报废
+            # 按工序汇总报废（归一到标准 PCB 工序目录后再聚合）
             r = self.erp.execute(f"""
-                SELECT TOP 10
+                SELECT
                     v.InspectionProcess AS process,
                     SUM(v.QtyOfUnit) AS scrap_pcs
                 FROM View_P_Inspection v
                 WHERE {insp_where} AND v.InspectionProcess IS NOT NULL
                 GROUP BY v.InspectionProcess
                 ORDER BY SUM(v.QtyOfUnit) DESC
-            """)
+            """, insp_params)
             if r.get("success") and r.get("data"):
                 total = result["total_scrap_pcs"] or 1
-                for row in r["data"]:
+                merged = merge_counts_by_process(
+                    [
+                        {
+                            "process": row.get("process", ""),
+                            "scrap_pcs": int(row.get("scrap_pcs") or 0),
+                        }
+                        for row in r["data"]
+                    ],
+                    name_key="process",
+                    sum_keys=["scrap_pcs"],
+                )
+                for row in merged[:10]:
                     sp = int(row.get("scrap_pcs") or 0)
                     result["process_scrap"].append({
                         "process": row.get("process", ""),
                         "scrap_pcs": sp,
-                        "ratio": round(sp * 100.0 / total, 1)
+                        "ratio": round(sp * 100.0 / total, 1),
                     })
 
             # 触发自主学习
@@ -2112,14 +2741,22 @@ class PCBQualitySystem:
 
         return result
 
-    def get_process_yield(self, part_number=None, fiscal_period=None):
-        """工序良率（MES）— 经 ERP 工单关联；可按 FiscalPeriod 限定当月工单。"""
+    def get_process_yield(self, part_number=None, fiscal_period=None,
+                          start_date=None, end_date=None):
+        """工序良率（MES）— 经 ERP 工单关联；支持 FiscalPeriod 或日期范围，
+        工单清单按块聚合，避免 200 条截断导致覆盖不全。"""
         result = {
             "process_yield": [], "process_defects": [], "inspect_records": [],
             "inspect_count": 0, "min_yield": None, "avg_yield": None, "wo_matched": 0,
+            "wo_without_mes": 0, "mes_process_total": 0, "mes_data_cutoff": None,
             "data_source": "MES:TBL_QM_INSPECT_RECORD",
             "has_data": False,
+            "rate_basis": "检验通过率（合格检验笔数/检验笔数；非单板一次通过率）",
             "fiscal_period": fiscal_period or "",
+            "date_filter": (
+                f"fiscal_period={fiscal_period}" if fiscal_period
+                else (f"{start_date or '不限'}~{end_date or '不限'}" if (start_date or end_date) else "all")
+            ),
         }
 
         if not self.mes or not self.mes.connected:
@@ -2127,118 +2764,292 @@ class PCBQualitySystem:
             return result
 
         try:
+            # MES 数据新鲜度（全局截止时间），供前端提示「MES 数据截至…」
+            r_cut = self.mes.execute(
+                "SELECT MAX(CCREATE_DATE) AS latest FROM TBL_QM_INSPECT_RECORD"
+            )
+            if r_cut.get("success") and r_cut.get("data"):
+                result["mes_data_cutoff"] = r_cut["data"][0].get("latest")
+
             # MES CMO_LOT = 工单号：先从 ERP 取工单，再查 MES
             wo_list = []
-            if self.erp and self.erp.connected and (part_number or fiscal_period):
+            if self.erp and self.erp.connected and (part_number or fiscal_period or start_date or end_date):
                 where_wo = ["1=1"]
+                wo_params = []
                 if part_number:
-                    where_wo.append(f"mp.mfgPartCode LIKE '%{part_number}%'")
+                    where_wo.append("mp.mfgPartCode LIKE ?")
+                    wo_params.append(f"%{part_number}%")
+                where_wo.append(self._scrap_part_excluded_sql("mp.mfgPartCode"))
                 if fiscal_period:
-                    where_wo.append(f"wo.FiscalPeriod = '{fiscal_period}'")
+                    where_wo.append("wo.FiscalPeriod = ?")
+                    wo_params.append(fiscal_period)
+                else:
+                    if start_date:
+                        where_wo.append("wo.createDate >= ?")
+                        wo_params.append(start_date)
+                    if end_date:
+                        where_wo.append("wo.createDate < ?")
+                        wo_params.append(_end_exclusive(end_date))
                 erp_r = self.erp.execute(f"""
                     SELECT DISTINCT wo.woNumber
                     FROM P_WO wo
                     INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
                     WHERE {' AND '.join(where_wo)}
-                """)
+                """, wo_params)
                 if erp_r.get("success") and erp_r.get("data"):
-                    wo_list = [d.get("woNumber", "") for d in erp_r["data"] if d.get("woNumber")]
+                    wo_list = sorted({
+                        d.get("woNumber", "") for d in erp_r["data"] if d.get("woNumber")
+                    })
                     result["wo_matched"] = len(wo_list)
                     logger.info(
-                        "工序查询 料号=%s 周期=%s 工单=%s",
-                        part_number or "全厂", fiscal_period or "不限", len(wo_list),
+                        "工序查询 料号=%s 周期=%s 日期=%s 工单=%s",
+                        part_number or "全厂", fiscal_period or "不限",
+                        result["date_filter"], len(wo_list),
                     )
 
-            # 有料号/周期过滤但无工单：不回退全库，避免口径错乱
-            if (part_number or fiscal_period) and not wo_list:
+            # 有料号/周期/日期过滤但无工单：不回退全库，避免口径错乱
+            if (part_number or fiscal_period or start_date or end_date) and not wo_list:
                 tip = []
                 if part_number:
                     tip.append(f"料号 {part_number}")
                 if fiscal_period:
                     tip.append(f"周期 {fiscal_period}")
+                if start_date or end_date:
+                    tip.append(f"日期 {result['date_filter']}")
                 result["data_gap"] = f"{' / '.join(tip)} 在 ERP 无关联工单，无法取 MES 工序良率"
                 return result
 
+            def _lot_sql(lots):
+                return ",".join("?" for _ in lots), [str(x) for x in lots]
+
+            # 按块查询并合并，避免 IN(...) 过长与 200 条截断
+            proc_map = {}
+            defect_map = {}
+            records = []
+            matched_lots = set()
+
+            def _ingest(chunk):
+                lot_ph, lot_params = _lot_sql(chunk)
+                wc = f"r.CRESULT IS NOT NULL AND r.CMO_LOT IN ({lot_ph})"
+                wc2 = (f"r.CRESULT = 2 AND i.CTEMPLATE_ITEM_NAME IS NOT NULL "
+                       f"AND r.CMO_LOT IN ({lot_ph})")
+                r = self.mes.execute(f"""
+                    SELECT
+                        r.CPROCESS_ID AS ProcessID,
+                        ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
+                        COUNT(*) AS InspectCount,
+                        SUM(CASE WHEN r.CRESULT = 1 THEN 1 ELSE 0 END) AS PassCount,
+                        SUM(CASE WHEN r.CRESULT = 2 THEN 1 ELSE 0 END) AS NgCount
+                    FROM TBL_QM_INSPECT_RECORD r
+                    LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                    WHERE {wc}
+                    GROUP BY r.CPROCESS_ID, p.CPROCESS_NAME
+                """, lot_params)
+                for row in (r.get("data") or []) if r.get("success") else []:
+                    key = (row.get("ProcessID"), row.get("ProcessName") or "")
+                    slot = proc_map.get(key)
+                    if slot is None:
+                        slot = {
+                            "ProcessID": row.get("ProcessID"),
+                            "ProcessName": row.get("ProcessName") or "",
+                            "InspectCount": 0, "PassCount": 0, "NgCount": 0,
+                        }
+                        proc_map[key] = slot
+                    slot["InspectCount"] += int(row.get("InspectCount") or 0)
+                    slot["PassCount"] += int(row.get("PassCount") or 0)
+                    slot["NgCount"] += int(row.get("NgCount") or 0)
+
+                r2 = self.mes.execute(f"""
+                    SELECT
+                        r.CPROCESS_ID AS ProcessID,
+                        ISNULL(p.CPROCESS_NAME, '未知工序') AS ProcessName,
+                        i.CTEMPLATE_ITEM_NAME AS DefectItem,
+                        i.CINPUT_VALUE AS DefectValue,
+                        COUNT(*) AS DefectCount
+                    FROM TBL_QM_INSPECT_RECORD r
+                    INNER JOIN TBL_QM_INSPECTION_RECORD_ITEM i ON r.CID = i.CINSPECTION_RECORD_ID
+                    LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                    WHERE {wc2}
+                    GROUP BY r.CPROCESS_ID, p.CPROCESS_NAME, i.CTEMPLATE_ITEM_NAME, i.CINPUT_VALUE
+                """, lot_params)
+                for row in (r2.get("data") or []) if r2.get("success") else []:
+                    key = (row.get("ProcessID"), row.get("DefectItem"), row.get("DefectValue"))
+                    if key in defect_map:
+                        defect_map[key]["DefectCount"] = (
+                            int(defect_map[key].get("DefectCount") or 0)
+                            + int(row.get("DefectCount") or 0)
+                        )
+                    else:
+                        defect_map[key] = dict(row)
+
+                r3 = self.mes.execute(f"""
+                    SELECT
+                        ISNULL(r.CMO_LOT, '') AS WoNumber,
+                        ISNULL(r.CSCAN_BARCODE, '') AS Barcode,
+                        ISNULL(r.CINSPECT_CODE, '') AS InspectCode,
+                        ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
+                        r.CRESULT AS ResultCode,
+                        CASE WHEN r.CRESULT = 1 THEN '合格' WHEN r.CRESULT = 2 THEN '不合格' ELSE '其他' END AS ResultName,
+                        r.CCREATE_DATE AS InspectTime,
+                        ISNULL(r.CSUBMIT_QTY, 0) AS InspectQty
+                    FROM TBL_QM_INSPECT_RECORD r
+                    LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                    WHERE r.CMO_LOT IN ({lot_ph})
+                    ORDER BY r.CCREATE_DATE DESC
+                    LIMIT 80
+                """, lot_params)
+                records.extend((r3.get("data") or []) if r3.get("success") else [])
+
+                r_lot = self.mes.execute(
+                    f"SELECT DISTINCT r.CMO_LOT AS lot FROM TBL_QM_INSPECT_RECORD r "
+                    f"WHERE r.CMO_LOT IN ({lot_ph})",
+                    lot_params,
+                )
+                if r_lot.get("success"):
+                    matched_lots.update(
+                        x.get("lot") for x in (r_lot.get("data") or []) if x.get("lot")
+                    )
+
             if wo_list:
-                wo_filter = "','".join(wo_list[:200])
-                where_clause = f"r.CRESULT IS NOT NULL AND r.CMO_LOT IN ('{wo_filter}')"
-                where_clause2 = f"r.CRESULT = 2 AND i.CTEMPLATE_ITEM_NAME IS NOT NULL AND r.CMO_LOT IN ('{wo_filter}')"
-                where_records = f"r.CMO_LOT IN ('{wo_filter}')"
+                for i in range(0, len(wo_list), 400):
+                    _ingest(wo_list[i:i + 400])
+                result["wo_without_mes"] = max(0, len(wo_list) - len(matched_lots))
             else:
-                where_clause = "r.CRESULT IS NOT NULL"
-                where_clause2 = "r.CRESULT = 2 AND i.CTEMPLATE_ITEM_NAME IS NOT NULL"
-                where_records = "r.CRESULT IS NOT NULL"
+                # 无过滤：全厂 MES 汇总（单次全表聚合，避免分块无意义）
+                r = self.mes.execute("""
+                    SELECT
+                        r.CPROCESS_ID AS ProcessID,
+                        ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
+                        COUNT(*) AS InspectCount,
+                        SUM(CASE WHEN r.CRESULT = 1 THEN 1 ELSE 0 END) AS PassCount,
+                        SUM(CASE WHEN r.CRESULT = 2 THEN 1 ELSE 0 END) AS NgCount
+                    FROM TBL_QM_INSPECT_RECORD r
+                    LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                    WHERE r.CRESULT IS NOT NULL
+                    GROUP BY r.CPROCESS_ID, p.CPROCESS_NAME
+                """)
+                for row in (r.get("data") or []) if r.get("success") else []:
+                    proc_map[(row.get("ProcessID"), row.get("ProcessName") or "")] = dict(row)
+                r2 = self.mes.execute("""
+                    SELECT
+                        r.CPROCESS_ID AS ProcessID,
+                        ISNULL(p.CPROCESS_NAME, '未知工序') AS ProcessName,
+                        i.CTEMPLATE_ITEM_NAME AS DefectItem,
+                        i.CINPUT_VALUE AS DefectValue,
+                        COUNT(*) AS DefectCount
+                    FROM TBL_QM_INSPECT_RECORD r
+                    INNER JOIN TBL_QM_INSPECTION_RECORD_ITEM i ON r.CID = i.CINSPECTION_RECORD_ID
+                    LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                    WHERE r.CRESULT = 2 AND i.CTEMPLATE_ITEM_NAME IS NOT NULL
+                    GROUP BY r.CPROCESS_ID, p.CPROCESS_NAME, i.CTEMPLATE_ITEM_NAME, i.CINPUT_VALUE
+                """)
+                for row in (r2.get("data") or []) if r2.get("success") else []:
+                    defect_map[(row.get("ProcessID"), row.get("DefectItem"), row.get("DefectValue"))] = dict(row)
+                r3 = self.mes.execute("""
+                    SELECT
+                        ISNULL(r.CMO_LOT, '') AS WoNumber,
+                        ISNULL(r.CSCAN_BARCODE, '') AS Barcode,
+                        ISNULL(r.CINSPECT_CODE, '') AS InspectCode,
+                        ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
+                        r.CRESULT AS ResultCode,
+                        CASE WHEN r.CRESULT = 1 THEN '合格' WHEN r.CRESULT = 2 THEN '不合格' ELSE '其他' END AS ResultName,
+                        r.CCREATE_DATE AS InspectTime,
+                        ISNULL(r.CSUBMIT_QTY, 0) AS InspectQty
+                    FROM TBL_QM_INSPECT_RECORD r
+                    LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                    WHERE r.CRESULT IS NOT NULL
+                    ORDER BY r.CCREATE_DATE DESC
+                    LIMIT 80
+                """)
+                records = (r3.get("data") or []) if r3.get("success") else []
                 logger.info("无料号/周期过滤，返回全厂工序数据")
 
-            r = self.mes.execute(f"""
-                SELECT TOP 20
-                    r.CPROCESS_ID AS ProcessID,
-                    ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
-                    COUNT(*) AS InspectCount,
-                    SUM(CASE WHEN r.CRESULT = 1 THEN 1 ELSE 0 END) AS PassCount,
-                    SUM(CASE WHEN r.CRESULT = 2 THEN 1 ELSE 0 END) AS NgCount,
-                    CAST(SUM(CASE WHEN r.CRESULT = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS DECIMAL(5,2)) AS PassRate
-                FROM TBL_QM_INSPECT_RECORD r
-                LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
-                WHERE {where_clause}
-                GROUP BY r.CPROCESS_ID, p.CPROCESS_NAME
-                ORDER BY InspectCount DESC
-            """)
-            if r.get("success") and r.get("data"):
-                data = r["data"]
-                for item in data:
-                    item["yield_rate"] = item.get("PassRate", 0)
-                result["process_yield"] = data
+            result["mes_process_total"] = len(proc_map)
+            # 归一并合并旧 SMT/细分工序名 → 标准 PCB 目录
+            raw_proc_rows = []
+            for slot in proc_map.values():
+                raw_proc_rows.append({
+                    "ProcessID": slot.get("ProcessID"),
+                    "ProcessName": normalize_process_name(slot.get("ProcessName")) or "待确认工序",
+                    "InspectCount": int(slot.get("InspectCount") or 0),
+                    "PassCount": int(slot.get("PassCount") or 0),
+                    "NgCount": int(slot.get("NgCount") or 0),
+                })
+            proc_rows = merge_counts_by_process(
+                raw_proc_rows,
+                name_key="ProcessName",
+                sum_keys=["InspectCount", "PassCount", "NgCount"],
+            )
+            # 禁止用 quality_metrics 伪填无 MES 检验实据的工序（如造数「蚀刻」）
 
-                rates = [float(d.get("PassRate", 0)) for d in data if d.get("PassRate") is not None]
-                if rates:
-                    result["min_yield"] = round(min(rates), 2)
-                    result["avg_yield"] = round(sum(rates) / len(rates), 2)
-                    result["has_data"] = True
-                    result["inspect_count"] = sum(int(d.get("InspectCount") or 0) for d in data)
-                else:
-                    result["data_gap"] = "MES 有工序行但无有效良率，请检查 CRESULT 是否完整"
+            for slot in proc_rows:
+                n = int(slot.get("InspectCount") or 0)
+                pass_n = int(slot.get("PassCount") or 0)
+                slot["PassRate"] = round(pass_n * 100.0 / n, 2) if n > 0 else None
+                slot["yield_rate"] = slot["PassRate"]
+            proc_rows.sort(key=lambda x: (
+                process_sort_key(x.get("ProcessName")),
+                -int(x.get("InspectCount") or 0),
+            ))
+            result["process_yield"] = proc_rows[:20]
+            result["process_catalog"] = list(STANDARD_PROCESSES)
 
-            # 不良项目明细
-            r2 = self.mes.execute(f"""
-                SELECT TOP 50
-                    r.CPROCESS_ID AS ProcessID,
-                    ISNULL(p.CPROCESS_NAME, '未知工序') AS ProcessName,
-                    i.CTEMPLATE_ITEM_NAME AS DefectItem,
-                    i.CINPUT_VALUE AS DefectValue,
-                    COUNT(*) AS DefectCount
-                FROM TBL_QM_INSPECT_RECORD r
-                INNER JOIN TBL_QM_INSPECTION_RECORD_ITEM i ON r.CID = i.CINSPECTION_RECORD_ID
-                LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
-                WHERE {where_clause2}
-                GROUP BY r.CPROCESS_ID, p.CPROCESS_NAME, i.CTEMPLATE_ITEM_NAME, i.CINPUT_VALUE
-                ORDER BY DefectCount DESC
-            """)
-            if r2.get("success"):
-                result["process_defects"] = r2.get("data", [])
+            # 良率均值/最差值仅统计样本 >=15 的工序，避免 1 笔 0% 拉低评分
+            min_sample = getattr(self.engine, "ALERT_MIN_INSPECT", 15)
+            reliable = [
+                d for d in proc_rows
+                if d.get("PassRate") is not None
+                and int(d.get("InspectCount") or 0) >= min_sample
+            ]
+            rates = [float(d.get("PassRate")) for d in reliable]
+            result["yield_sample_ok"] = bool(reliable)
+            result["low_sample_processes"] = [
+                d.get("ProcessName") for d in proc_rows
+                if d.get("PassRate") is not None
+                and int(d.get("InspectCount") or 0) < min_sample
+            ]
+            if rates:
+                result["min_yield"] = round(min(rates), 2)
+                result["avg_yield"] = round(sum(rates) / len(rates), 2)
+                worst = min(reliable, key=lambda x: float(x.get("PassRate") or 0))
+                result["min_yield_process"] = worst.get("ProcessName") or ""
+                result["min_yield_sample"] = int(worst.get("InspectCount") or 0)
+                result["has_data"] = True
+            if proc_rows:
+                result["has_data"] = True
+                result["inspect_count"] = sum(
+                    int(d.get("InspectCount") or 0) for d in proc_rows
+                )
+                if not rates:
+                    result["data_gap"] = (
+                        f"MES 工序样本均 <{min_sample} 笔，良率均值不可靠（仅展示明细）"
+                    )
+            elif not proc_rows:
+                result["data_gap"] = result.get("data_gap") or "MES 无工序检验记录"
 
-            # 检验履历（工单/条码/工序/结果/时间）— 追溯页核心
-            # 实际字段：CCREATE_DATE / CSUBMIT_QTY / CINSPECT_CODE（非 CINSPECT_TIME）
-            r3 = self.mes.execute(f"""
-                SELECT TOP 80
-                    ISNULL(r.CMO_LOT, '') AS WoNumber,
-                    ISNULL(r.CSCAN_BARCODE, '') AS Barcode,
-                    ISNULL(r.CINSPECT_CODE, '') AS InspectCode,
-                    ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
-                    r.CRESULT AS ResultCode,
-                    CASE WHEN r.CRESULT = 1 THEN '合格' WHEN r.CRESULT = 2 THEN '不合格' ELSE '其他' END AS ResultName,
-                    r.CCREATE_DATE AS InspectTime,
-                    ISNULL(r.CSUBMIT_QTY, 0) AS InspectQty
-                FROM TBL_QM_INSPECT_RECORD r
-                LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
-                WHERE {where_records}
-                ORDER BY r.CCREATE_DATE DESC
-            """)
-            if r3.get("success"):
-                result["inspect_records"] = r3.get("data", [])
-                result["inspect_count"] = len(result["inspect_records"])
-            else:
-                logger.warning(f"MES检验履历查询失败: {r3.get('error')}")
+            defect_rows = []
+            for row in defect_map.values():
+                item = dict(row)
+                item["ProcessName"] = (
+                    normalize_process_name(item.get("ProcessName")) or "待确认工序"
+                )
+                defect_rows.append(item)
+            defect_rows = merge_counts_by_process(
+                defect_rows,
+                name_key="ProcessName",
+                sum_keys=["DefectCount"],
+            )
+            defect_rows.sort(key=lambda x: -int(x.get("DefectCount") or 0))
+            result["process_defects"] = defect_rows[:50]
+
+            for rec in records:
+                rec["ProcessName"] = (
+                    normalize_process_name(rec.get("ProcessName")) or "待确认工序"
+                )
+            records.sort(key=lambda x: str(x.get("InspectTime") or ""), reverse=True)
+            result["inspect_records"] = records[:80]
+            if records:
+                result["inspect_count"] = max(result["inspect_count"], len(result["inspect_records"]))
 
         except Exception as e:
             logger.error(f"工序良率查询失败: {e}")
@@ -2256,7 +3067,10 @@ class PCBQualitySystem:
         """
         result = {
             "total_wo": 0, "total_input_pcs": 0, "total_reject_pcs": 0,
-            "reject_rate": 0, "work_orders": [], "daily_trend": []
+            "reject_pcs_erp_field": 0, "reject_rate": 0,
+            "reject_source": "", "unlinked_scrap_pcs": 0,
+            "wo_without_inspection": 0, "data_gap": None,
+            "work_orders": [], "daily_trend": []
         }
 
         if not self.erp or not self.erp.connected:
@@ -2264,23 +3078,102 @@ class PCBQualitySystem:
 
         try:
             where_parts = []
+            safe_part = None
             if part_number:
-                where_parts.append(f"mp.mfgPartCode LIKE '%{part_number}%'")
-            
+                safe_part = str(part_number).replace("'", "''")
+                where_parts.append(f"mp.mfgPartCode LIKE '%{safe_part}%'")
+            where_parts.append(self._scrap_part_excluded_sql("mp.mfgPartCode"))
+            end_excl = None
             # 优先使用FiscalPeriod
             if fiscal_period:
                 where_parts.append(f"wo.FiscalPeriod = '{fiscal_period}'")
             else:
-                # 兼容旧接口：使用日期范围
+                # 兼容旧接口：使用日期范围（右开区间，避免 end 当天漏计）
                 if start_date:
                     where_parts.append(f"wo.createDate >= '{start_date}'")
                 if end_date:
-                    where_parts.append(f"wo.createDate <= '{end_date} 23:59:59'")
+                    end_excl = _end_exclusive(end_date)
+                    where_parts.append(f"wo.createDate < '{end_excl}'")
 
             where_sql = " AND ".join(where_parts) if where_parts else "1=1"
 
+            # 全量汇总（不受列表 TOP 限制；旧版只统计 TOP100 会低估总量）
             r = self.erp.execute(f"""
-                SELECT TOP 100
+                SELECT COUNT(*) AS TotalWo,
+                       IFNULL(SUM(wo.qty_PCS_PRODUCED), 0) AS TotalInput,
+                       IFNULL(SUM(wo.reject_PCS), 0) AS TotalRejectField
+                FROM P_WO wo
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {where_sql}
+            """)
+            if r.get("success") and r.get("data"):
+                row = r["data"][0]
+                result["total_wo"] = int(row.get("TotalWo") or 0)
+                result["total_input_pcs"] = int(row.get("TotalInput") or 0)
+                result["reject_pcs_erp_field"] = int(row.get("TotalRejectField") or 0)
+
+            # 按工单重算报废：View_P_Inspection.WONumber → P_WO.woNumber（以质量实绩为准）
+            scrap_map = {}
+            r = self.erp.execute(f"""
+                SELECT v.WONumber AS WONumber, SUM(v.QtyOfUnit) AS ScrapPcs
+                FROM View_P_Inspection v
+                INNER JOIN P_WO wo ON v.WONumber = wo.woNumber
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {where_sql} AND v.InspectionResult = 'Scrapped'
+                  AND {self._scrap_part_excluded_sql('v.MfgPartCode')}
+                GROUP BY v.WONumber
+            """)
+            if r.get("success") and r.get("data"):
+                for row in r["data"]:
+                    wn = str(row.get("WONumber") or "")
+                    if wn:
+                        scrap_map[wn] = int(row.get("ScrapPcs") or 0)
+            result["total_reject_pcs"] = int(sum(scrap_map.values()))
+            result["reject_source"] = "ERP:View_P_Inspection.WONumber"
+            if result["total_reject_pcs"] <= 0 and result.get("reject_pcs_erp_field", 0) > 0:
+                # 没有任何检验实绩可关联时降级用 P_WO 字段，并明确标注
+                result["total_reject_pcs"] = int(result["reject_pcs_erp_field"])
+                result["reject_source"] = "ERP:P_WO.reject_PCS（无检验关联，降级口径）"
+
+            # 时间窗/周期内未关联 WONumber 的报废（单独披露，不摊入工单口径）
+            v_window = []
+            if fiscal_period:
+                v_window.append(f"v.FiscalPeriod = '{fiscal_period}'")
+            else:
+                if start_date:
+                    v_window.append(f"v.CreateDate >= '{start_date}'")
+                if end_excl:
+                    v_window.append(f"v.CreateDate < '{end_excl}'")
+            v_window_sql = " AND ".join(["1=1"] + v_window)
+            v_part_sql = f" AND v.MfgPartCode LIKE '%{safe_part}%'" if safe_part else ""
+            result["unlinked_scrap_pcs"] = 0
+            r = self.erp.execute(f"""
+                SELECT IFNULL(SUM(v.QtyOfUnit), 0) AS UnlinkedScrap
+                FROM View_P_Inspection v
+                WHERE {v_window_sql} AND v.InspectionResult = 'Scrapped'
+                  AND {self._scrap_non_production_sql()}{v_part_sql}
+                  AND (IFNULL(v.WONumber, '') = '' OR v.WONumber NOT IN (SELECT woNumber FROM P_WO))
+            """)
+            if r.get("success") and r.get("data"):
+                result["unlinked_scrap_pcs"] = int(r["data"][0].get("UnlinkedScrap") or 0)
+
+            # 无任何检验记录的工单数（关联缺口披露）
+            result["wo_without_inspection"] = 0
+            r = self.erp.execute(f"""
+                SELECT COUNT(*) AS Missing
+                FROM P_WO wo
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {where_sql}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM View_P_Inspection v WHERE v.WONumber = wo.woNumber
+                  )
+            """)
+            if r.get("success") and r.get("data"):
+                result["wo_without_inspection"] = int(r["data"][0].get("Missing") or 0)
+
+            # 列表（最多 200；逐单附 View_P_Inspection 重算报废）
+            r = self.erp.execute(f"""
+                SELECT TOP 200
                     wo.woNumber, mp.mfgPartCode AS PartNumber, mp.mfgPartName AS PartName,
                     wo.qty_PCS_PRODUCED AS PcsProduced, wo.reject_PCS AS RejectPcs,
                     wo.qty_PNL_PRODUCED AS PnlProduced, wo.createDate, wo.endDate, wo.status
@@ -2289,29 +3182,72 @@ class PCBQualitySystem:
                 WHERE {where_sql}
                 ORDER BY wo.createDate DESC
             """)
-
             if r.get("success") and r.get("data"):
                 wos = r["data"]
-                result["total_wo"] = len(wos)
-                result["work_orders"] = wos[:50]
-
-                daily = defaultdict(lambda: {"input": 0, "reject": 0})
                 for wo in wos:
-                    result["total_input_pcs"] += int(wo.get("PcsProduced") or 0)
-                    result["total_reject_pcs"] += int(wo.get("RejectPcs") or 0)
-                    d = str(wo.get("createDate", ""))[:10]
-                    if d:
-                        daily[d]["input"] += int(wo.get("PcsProduced") or 0)
-                        daily[d]["reject"] += int(wo.get("RejectPcs") or 0)
+                    wn = str(wo.get("woNumber") or "")
+                    if wn in scrap_map:
+                        wo["RejectPcs"] = scrap_map[wn]
+                        wo["RejectSource"] = "View_P_Inspection"
+                    else:
+                        wo["RejectPcs"] = int(wo.get("RejectPcs") or 0)
+                        wo["RejectSource"] = "P_WO.reject_PCS"
+                result["work_orders"] = wos[:200]
+                if len(wos) < result["total_wo"]:
+                    result["list_truncated"] = True
 
-                if result["total_input_pcs"] > 0:
-                    result["reject_rate"] = round(
-                        result["total_reject_pcs"] * 100.0 / result["total_input_pcs"], 2
-                    )
-                result["daily_trend"] = [
-                    {"date": k, "input_pcs": v["input"], "reject_pcs": v["reject"]}
-                    for k, v in sorted(daily.items())
-                ]
+            # 日趋势：投入按 P_WO.createDate 聚合，报废按检验实绩关联聚合
+            daily = {}
+            r = self.erp.execute(f"""
+                SELECT substr(wo.createDate, 1, 10) AS Day,
+                       IFNULL(SUM(wo.qty_PCS_PRODUCED), 0) AS Input
+                FROM P_WO wo
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {where_sql}
+                GROUP BY substr(wo.createDate, 1, 10)
+            """)
+            if r.get("success") and r.get("data"):
+                for row in r["data"]:
+                    d = str(row.get("Day") or "")
+                    if d:
+                        daily.setdefault(d, {"input": 0, "reject": 0})["input"] += int(row.get("Input") or 0)
+            r = self.erp.execute(f"""
+                SELECT substr(v.CreateDate, 1, 10) AS Day,
+                       IFNULL(SUM(v.QtyOfUnit), 0) AS Scrap
+                FROM View_P_Inspection v
+                INNER JOIN P_WO wo ON v.WONumber = wo.woNumber
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {where_sql} AND v.InspectionResult = 'Scrapped'
+                  AND {self._scrap_part_excluded_sql('v.MfgPartCode')}
+                GROUP BY substr(v.CreateDate, 1, 10)
+            """)
+            if r.get("success") and r.get("data"):
+                for row in r["data"]:
+                    d = str(row.get("Day") or "")
+                    if d:
+                        daily.setdefault(d, {"input": 0, "reject": 0})["reject"] += int(row.get("Scrap") or 0)
+
+            if result["total_input_pcs"] > 0:
+                result["reject_rate"] = round(
+                    result["total_reject_pcs"] * 100.0 / result["total_input_pcs"], 2
+                )
+            result["daily_trend"] = [
+                {"date": k, "input_pcs": v["input"], "reject_pcs": v["reject"]}
+                for k, v in sorted(daily.items())
+            ]
+
+            gaps = []
+            if result["total_wo"] and result["wo_without_inspection"]:
+                gaps.append(
+                    f"{result['wo_without_inspection']} 张工单无 View_P_Inspection 检验记录，"
+                    "工单报废率仅含可关联部分"
+                )
+            if result["unlinked_scrap_pcs"]:
+                gaps.append(
+                    f"另有 {result['unlinked_scrap_pcs']} PCS 报废未关联 WONumber，"
+                    "未计入工单口径（见全厂报废分析）"
+                )
+            result["data_gap"] = "；".join(gaps) if gaps else None
 
         except Exception as e:
             logger.error(f"工单查询失败: {e}")
@@ -2337,8 +3273,10 @@ class PCBQualitySystem:
         if fiscal_period:
             pass
         elif period:
-            year, month = period.split("-")
-            fiscal_period = f"{year}{month}"
+            parts = _period_parts(period)
+            if not parts:
+                return {"success": False, "error": f"周期格式无效：{period}"}
+            fiscal_period = parts[0]
         elif not start_date and not end_date:
             fiscal_period = datetime.now().strftime("%Y%m")
         else:
@@ -2346,7 +3284,11 @@ class PCBQualitySystem:
 
         # 1. 各维度数据（无料号=全厂当月；MES 按同周期工单关联）
         scrap = self.get_scrap_analysis(part_number, start_date, end_date, fiscal_period=fiscal_period)
-        process = self.get_process_yield(part_number, fiscal_period=fiscal_period)
+        process = self.get_process_yield(
+            part_number, fiscal_period=fiscal_period,
+            start_date=start_date if not fiscal_period else None,
+            end_date=end_date if not fiscal_period else None,
+        )
         wo = self.get_work_orders(part_number, start_date, end_date, fiscal_period=fiscal_period)
 
         scrap_rate = scrap.get("scrap_rate", 0)
@@ -2358,19 +3300,25 @@ class PCBQualitySystem:
         # 客诉 / COPQ（与体检周期对齐：FiscalPeriod→当月日历；否则用日期范围）
         if fiscal_period and len(str(fiscal_period)) >= 6:
             fp = str(fiscal_period)
-            y, m = int(fp[:4]), int(fp[4:6])
-            c_start = f"{y}-{m:02d}-01"
-            if m == 12:
-                c_end = f"{y + 1}-01-01"
-            else:
-                c_end = f"{y}-{m + 1:02d}-01"
+            c_start = f"{fp[:4]}-{fp[4:6]}-01"
+            c_end = _month_end_inclusive(fp)  # 含当月最后一天；COPQ 内部统一转右开
         else:
             c_start, c_end = start_date, end_date
         copq = self.get_copq_analysis(c_start, c_end, part_number=part_number)
         has_complaint = bool(copq.get("has_data"))
 
-        # IQC（有 ERP 实表则计分；不做设备 OEE）
-        gates = self.get_inspection_gate_kpis(30)
+        # IQC（有 ERP 实表则计分；不做设备 OEE）——与体检周期对齐，避免历史周期仍用近30天口径
+        if fiscal_period and str(fiscal_period).isdigit() and len(str(fiscal_period)) >= 6:
+            _fp = str(fiscal_period)
+            gate_start = f"{_fp[:4]}-{_fp[4:6]}-01"
+            _gy, _gm = int(_fp[:4]), int(_fp[4:6])
+            gate_end = f"{_gy + 1}-01-01" if _gm == 12 else f"{_gy}-{_gm + 1:02d}-01"
+        elif start_date or end_date:
+            gate_start = start_date
+            gate_end = _end_exclusive(end_date) if end_date else None
+        else:
+            gate_start = gate_end = None
+        gates = self.get_inspection_gate_kpis(30, start_date=gate_start, end_date=gate_end)
         iqc_info = gates.get("iqc") or {}
 
         # 2. 评分计算（仅品质相关 ERP/MES 实测）
@@ -2405,6 +3353,7 @@ class PCBQualitySystem:
             process.get("process_yield", []),
             scrap.get("monthly_trend", []),
             scrap_pcs=float(scrap.get("total_scrap_pcs") or 0),
+            fiscal_period=fiscal_period or "",
         )
 
         # 5. 存储报告（含 ERP/MES 实据快照，供历史页核验；无实据不落库）
@@ -2423,13 +3372,14 @@ class PCBQualitySystem:
             date_range = "不限 ~ 不限"
 
         key = part_number or "ALL"
-        ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        report_id = f"HR-{key[:12]}-{ts}"
-        # report_no 含时分秒，避免同日同料号撞号无法区分
-        report_no = (
-            f"QHC-{ts}-"
-            f"{hashlib.md5(f'{key}|{fiscal_period or date_range}|{ts}'.encode()).hexdigest()[:6].upper()}"
-        )
+        now = datetime.now()
+        day = now.strftime("%Y%m%d")
+        # 同料号+同周期当日只保留一份快照：重复体检=原地刷新，避免只读请求无限新增历史
+        scope_key = hashlib.md5(
+            f"{key}|{fiscal_period or date_range}".encode()
+        ).hexdigest()[:8]
+        report_id = f"HR-{key[:12]}-{day}-{scope_key}"
+        report_no = f"QHC-{day}-{scope_key.upper()}"
 
         top_defects = (scrap.get("defect_top10") or [])[:8]
         evidence = {
@@ -2440,7 +3390,8 @@ class PCBQualitySystem:
             "has_scrap": has_scrap,
             "has_mes": has_mes,
             "has_complaint": has_complaint,
-            "scrap_rate": float(scrap.get("scrap_rate") or 0) if has_scrap else None,
+            "scrap_rate": scrap.get("scrap_rate") if has_scrap else None,
+            "rate_reliable": bool(scrap.get("rate_reliable")),
             "scrap_pcs": int(scrap.get("total_scrap_pcs") or 0),
             "stock_pcs": int(scrap.get("total_in_stock_pcs") or 0),
             "copq_total": float((copq.get("kpi") or {}).get("copq_total") or 0) if has_complaint else None,
@@ -2466,7 +3417,7 @@ class PCBQualitySystem:
                     "inspect_count": int(p.get("InspectCount") or p.get("total_qty") or 0),
                 }
                 for p in (process.get("process_yield") or [])
-                if float(p.get("PassRate", p.get("yield_rate", 100)) or 100) < 98
+                if (pr := p.get("PassRate", p.get("yield_rate"))) is not None and float(pr) < 98
             ][:10],
             "work_order_count": len(wo.get("work_orders") or []),
             "data_sources": "ERP:View_P_Inspection+FGI+P_WO; MES:TBL_QM_INSPECT_RECORD",
@@ -2555,6 +3506,7 @@ class PCBQualitySystem:
         近 N 个连续 FiscalPeriod 报废/入库/报废率序列（领导 MoM/趋势）。
         轴固定 N 个月；ERP 无记录的月份以空点展示，不伪造报废率。
         口径与 get_scrap_analysis 一致：报废/(报废+FGI入库)。
+        一次分组聚合取满整个窗口，避免逐月重复扫描 View_P_Inspection。
         """
         months = max(3, min(int(months or 12), 24))
         if not (self.erp and self.erp.connected):
@@ -2575,19 +3527,81 @@ class PCBQualitySystem:
                     end_fp = latest
 
             fps = self._fiscal_period_window(end_fp, months)
+            if not fps:
+                return []
+            fp_lo, fp_hi = fps[0], fps[-1]
+
+            # 1) 报废 PCS（按检验周期）
+            scrap_by_fp = {}
+            r = self.erp.execute(f"""
+                SELECT v.FiscalPeriod AS fp, SUM(v.QtyOfUnit) AS scrap
+                FROM View_P_Inspection v
+                WHERE {self._scrap_non_production_sql()}
+                  AND v.FiscalPeriod >= '{fp_lo}' AND v.FiscalPeriod <= '{fp_hi}'
+                GROUP BY v.FiscalPeriod
+            """)
+            if r.get("success") and r.get("data"):
+                for row in r["data"]:
+                    fp = str(row.get("fp") or "")
+                    if fp:
+                        scrap_by_fp[fp] = int(row.get("scrap") or 0)
+
+            # 2) FGI 入库 PCS（按工单周期，与 get_scrap_analysis 同口径）
+            stock_by_fp = {}
+            r = self.erp.execute(f"""
+                SELECT wo.FiscalPeriod AS fp, SUM(sfiwo.qtyOfPCS) AS stock
+                FROM FGI_StockFormItemWO sfiwo
+                INNER JOIN FGI_StockFormItem sfi ON sfiwo.stockFormItemId = sfi.recId
+                INNER JOIN P_WO wo ON sfiwo.woId = wo.recId
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {self._scrap_part_excluded_sql('mp.mfgPartCode')}
+                  AND wo.FiscalPeriod >= '{fp_lo}' AND wo.FiscalPeriod <= '{fp_hi}'
+                GROUP BY wo.FiscalPeriod
+            """)
+            if r.get("success") and r.get("data"):
+                for row in r["data"]:
+                    fp = str(row.get("fp") or "")
+                    if fp:
+                        stock_by_fp[fp] = int(row.get("stock") or 0)
+
+            # 3) 工单产出回退（无 FGI 的月份用产出近似入库）
+            produced_by_fp = {}
+            r = self.erp.execute(f"""
+                SELECT wo.FiscalPeriod AS fp, SUM(wo.qty_PCS_PRODUCED) AS produced
+                FROM P_WO wo
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE (wo.qty_PCS_PRODUCED > 0 OR wo.reject_PCS > 0)
+                  AND {self._scrap_part_excluded_sql('mp.mfgPartCode')}
+                  AND wo.FiscalPeriod >= '{fp_lo}' AND wo.FiscalPeriod <= '{fp_hi}'
+                GROUP BY wo.FiscalPeriod
+            """)
+            if r.get("success") and r.get("data"):
+                for row in r["data"]:
+                    fp = str(row.get("fp") or "")
+                    if fp:
+                        produced_by_fp[fp] = int(row.get("produced") or 0)
+
             series = []
             for fp in fps:
-                scrap = self.get_scrap_analysis(None, None, None, fiscal_period=fp)
-                scrap_pcs = int(scrap.get("total_scrap_pcs") or 0)
-                stock_pcs = int(scrap.get("total_in_stock_pcs") or 0)
+                scrap_pcs = int(scrap_by_fp.get(fp) or 0)
+                fgi_pcs = int(stock_by_fp.get(fp) or 0)
+                produced_pcs = int(produced_by_fp.get(fp) or 0)
+                if fgi_pcs > 0:
+                    stock_pcs, stock_source = fgi_pcs, "FGI_StockFormItemWO"
+                elif produced_pcs > 0:
+                    stock_pcs, stock_source = produced_pcs, "P_WO.qty_PCS_PRODUCED"
+                else:
+                    stock_pcs, stock_source = 0, "none"
                 input_pcs = scrap_pcs + stock_pcs
                 # 无入库仅有报废时，报废率=100% 会误导领导，标记为口径不全
                 rate_reliable = stock_pcs > 0 and input_pcs > 0
                 rate = round(scrap_pcs * 100.0 / input_pcs, 2) if rate_reliable else None
-                has_data = bool(scrap.get("has_data") or scrap_pcs or stock_pcs)
-                gap = scrap.get("data_gap")
+                has_data = bool(scrap_pcs or stock_pcs)
+                gap = None
+                if stock_source == "P_WO.qty_PCS_PRODUCED":
+                    gap = "本期无 FGI 入库记录，入库口径回退为工单产出 PCS（近似）"
                 if scrap_pcs > 0 and stock_pcs <= 0:
-                    gap = gap or "仅有报废PCS，无 FGI/工单入库口径，不计算报废率"
+                    gap = "仅有报废PCS，无 FGI/工单入库口径，不计算报废率"
                 elif not has_data:
                     gap = "本期无报废/入库记录"
                 series.append({
@@ -2598,7 +3612,7 @@ class PCBQualitySystem:
                     "input_pcs": input_pcs,
                     "scrap_rate": rate,
                     "rate_reliable": rate_reliable,
-                    "stock_source": scrap.get("stock_source") or ("FGI" if stock_pcs else "none"),
+                    "stock_source": stock_source,
                     "data_gap": gap,
                     "has_data": has_data,
                 })
@@ -2864,7 +3878,7 @@ class PCBQualitySystem:
             rr = db.execute(f"""
                 SELECT q.inspection_no, q.inspection_result, q.status,
                        q.product_code, q.material_code, q.material_name,
-                       q.process_name, q.defect_reason, q.inspected_at,
+                       q.process_name, q.defect_type AS defect_reason, q.inspected_at,
                        q.inspected_qty, q.non_conforming_qty, q.inspector,
                        IFNULL(m.supplier_code, '') AS supplier_code,
                        IFNULL(m.supplier_name, '') AS supplier_name
@@ -2899,12 +3913,17 @@ class PCBQualitySystem:
             result["data_gaps"].append(str(e))
             return result
 
-    def get_inspection_gate_kpis(self, day_count: int = 30) -> dict:
+    def get_inspection_gate_kpis(self, day_count: int = 30, start_date=None, end_date=None) -> dict:
         """
         来料(IQC)/终检(FQC)/一次交验/复检返工 —— 来自 quality_inspection_records 实表。
         inspection_type: incoming / final / process；is_reinspection=1 视为复检。
+        传入 start_date/end_date（右开区间）时按指定周期统计（供体检周期对齐）；
+        不传时按最近 day_count 天滚动统计（总览等实时口径）。
         """
         n = max(7, min(int(day_count or 30), 90))
+        use_range = bool(start_date or end_date)
+        safe_start = str(start_date).replace("'", "''").strip() if start_date else None
+        safe_end = str(end_date).replace("'", "''").strip() if end_date else None
         result = {
             "has_data": False,
             "day_count": n,
@@ -2931,6 +3950,18 @@ class PCBQualitySystem:
             )"""
 
             def _fetch(days):
+                if use_range:
+                    conds = ["inspected_at IS NOT NULL"]
+                    if safe_start:
+                        conds.append(f"inspected_at >= '{safe_start}'")
+                    if safe_end:
+                        conds.append(f"inspected_at < '{safe_end}'")
+                    where_time = " AND ".join(conds)
+                else:
+                    where_time = (
+                        "inspected_at IS NOT NULL "
+                        f"AND inspected_at >= datetime('now', '-{int(days)} day')"
+                    )
                 rr = db.execute(f"""
                     SELECT inspection_type,
                            IFNULL(is_reinspection,0) AS is_re,
@@ -2938,8 +3969,7 @@ class PCBQualitySystem:
                            SUM(CASE WHEN {done_expr} THEN 1 ELSE 0 END) AS done_c,
                            SUM(CASE WHEN {pass_expr} THEN 1 ELSE 0 END) AS pass_c
                     FROM quality_inspection_records
-                    WHERE inspected_at IS NOT NULL
-                      AND inspected_at >= datetime('now', '-{int(days)} day')
+                    WHERE {where_time}
                     GROUP BY inspection_type, IFNULL(is_reinspection,0)
                 """)
                 return rr
@@ -2981,8 +4011,9 @@ class PCBQualitySystem:
              fty_c, fty_p, re_c, proc_base) = _agg(rows)
 
             # IQC/FQC 近窗为空时，放宽到 180 天仍只展示实据，并标注窗口
+            # （指定周期范围时不回退，保持与所选周期一致）
             extended = False
-            if iqc_c == 0 or fqc_c == 0:
+            if not use_range and (iqc_c == 0 or fqc_c == 0):
                 r2 = _fetch(180)
                 if r2.get("success") and r2.get("data"):
                     (iqc_c2, iqc_d2, iqc_p2, fqc_c2, fqc_d2, fqc_p2,
@@ -3024,13 +4055,19 @@ class PCBQualitySystem:
                 "rate": round(re_c * 100.0 / proc_base, 2) if proc_base > 0 else None,
             }
             if iqc_c == 0:
-                result["data_gaps"].append("近180日无 incoming（IQC）检验记录")
+                result["data_gaps"].append(
+                    "所选周期无 incoming（IQC）检验记录" if use_range
+                    else "近180日无 incoming（IQC）检验记录"
+                )
             elif iqc_d < 30:
                 result["data_gaps"].append(
                     f"IQC 已出结论仅 {iqc_d} 单（共 {iqc_c}），样本不足仅供参考"
                 )
             if fqc_c == 0:
-                result["data_gaps"].append("近180日无 final（FQC/出货）检验记录")
+                result["data_gaps"].append(
+                    "所选周期无 final（FQC/出货）检验记录" if use_range
+                    else "近180日无 final（FQC/出货）检验记录"
+                )
             elif fqc_d < 30:
                 result["data_gaps"].append(
                     f"FQC 已出结论仅 {fqc_d} 单（共 {fqc_c}），样本不足仅供参考"
@@ -3086,6 +4123,401 @@ class PCBQualitySystem:
             empty["data_gap"] = str(e)
             return empty
 
+    def get_part_options(self, fiscal_period=None, limit: int = 300, q: str = None):
+        """ERP 料号下拉（只读实据）。
+
+        来源：P_WO×E_JobMfgParts + View_P_Inspection 报废料号；
+        排除 TEST- 非量产前缀；禁止编造料号。
+        """
+        lim = max(20, min(int(limit or 300), 800))
+        fp = (fiscal_period or "").strip() or None
+        keyword = (q or "").strip()
+        result = {
+            "has_data": False,
+            "fiscal_period": fp or "",
+            "parts": [],
+            "data_source": "ERP:P_WO + View_P_Inspection",
+            "formula": "DISTINCT 料号来自工单与报废视图，排除 TEST- 前缀",
+        }
+        if not (self.erp and self.erp.connected):
+            result["data_gap"] = "ERP 未连接"
+            return result
+
+        try:
+            merged: dict[str, dict] = {}
+
+            def _add(code, name="", scrap=None, stock=None):
+                code = str(code or "").strip()
+                if not code or code.upper().startswith("TEST-"):
+                    return
+                if keyword and keyword.upper() not in code.upper() and keyword not in str(name or ""):
+                    return
+                slot = merged.get(code)
+                if slot is None:
+                    slot = {"part_number": code, "part_name": "", "scrap_pcs": 0}
+                    merged[code] = slot
+                if name and not slot.get("part_name"):
+                    slot["part_name"] = str(name).strip()
+                if scrap is not None:
+                    try:
+                        slot["scrap_pcs"] = int(slot.get("scrap_pcs") or 0) + int(float(scrap or 0))
+                    except (TypeError, ValueError):
+                        pass
+
+            # 先取报废 TOP（View_P_Inspection 无料名列，名称后续用工单表补）
+            scrap_where = [self._scrap_non_production_sql(), "IFNULL(v.MfgPartCode,'') <> ''"]
+            scrap_params: list = []
+            if fp:
+                scrap_where.append("v.FiscalPeriod = ?")
+                scrap_params.append(fp)
+            if keyword:
+                scrap_where.append("v.MfgPartCode LIKE ?")
+                scrap_params.append(f"%{keyword}%")
+            r_sc = self.erp.execute(
+                f"""
+                SELECT TOP {lim}
+                       v.MfgPartCode AS part_number,
+                       SUM(v.QtyOfUnit) AS scrap_pcs
+                FROM View_P_Inspection v
+                WHERE {' AND '.join(scrap_where)}
+                GROUP BY v.MfgPartCode
+                ORDER BY SUM(v.QtyOfUnit) DESC
+                """,
+                scrap_params,
+            )
+            for row in (r_sc.get("data") or []):
+                _add(row.get("part_number"), scrap=row.get("scrap_pcs"))
+
+            # 再取工单料号（补全无报废料号 + 料名）
+            wo_where = ["IFNULL(mp.mfgPartCode,'') <> ''", "IFNULL(mp.mfgPartCode,'') NOT LIKE 'TEST-%'"]
+            wo_params: list = []
+            if fp:
+                wo_where.append("wo.FiscalPeriod = ?")
+                wo_params.append(fp)
+            if keyword:
+                wo_where.append(
+                    "(mp.mfgPartCode LIKE ? OR IFNULL(mp.mfgPartName,'') LIKE ?)"
+                )
+                wo_params.extend([f"%{keyword}%", f"%{keyword}%"])
+            r_wo = self.erp.execute(
+                f"""
+                SELECT DISTINCT TOP {lim}
+                       mp.mfgPartCode AS part_number,
+                       IFNULL(mp.mfgPartName, '') AS part_name
+                FROM P_WO wo
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                WHERE {' AND '.join(wo_where)}
+                ORDER BY mp.mfgPartCode
+                """,
+                wo_params,
+            )
+            for row in (r_wo.get("data") or []):
+                _add(row.get("part_number"), row.get("part_name"))
+
+            # 报废料号若缺料名，再按料号反查 E_JobMfgParts（参数化 IN）
+            missing = [c for c, s in merged.items() if not s.get("part_name")]
+            if missing:
+                for i in range(0, min(len(missing), lim), 80):
+                    chunk = missing[i:i + 80]
+                    placeholders = ",".join("?" * len(chunk))
+                    r_nm = self.erp.execute(
+                        f"""
+                        SELECT TOP {len(chunk)}
+                               mp.mfgPartCode AS part_number,
+                               IFNULL(MAX(mp.mfgPartName), '') AS part_name
+                        FROM E_JobMfgParts mp
+                        WHERE mp.mfgPartCode IN ({placeholders})
+                        GROUP BY mp.mfgPartCode
+                        """,
+                        chunk,
+                    )
+                    for row in (r_nm.get("data") or []):
+                        _add(row.get("part_number"), row.get("part_name"))
+
+            parts = list(merged.values())
+            parts.sort(key=lambda x: (-int(x.get("scrap_pcs") or 0), str(x.get("part_number") or "")))
+            result["parts"] = parts[:lim]
+            result["has_data"] = bool(result["parts"])
+            result["count"] = len(result["parts"])
+            if not result["parts"]:
+                result["data_gap"] = "ERP 无可用料号（工单/报废视图）"
+            return result
+        except Exception as e:
+            result["data_gap"] = str(e)
+            return result
+
+    def get_closed_loop_stats(self, fiscal_period=None) -> dict:
+        """当月异常料号 ↔ 8D 闭环（只统计有生产报废的料号，禁止用全库 8D 冒充）。"""
+        fp = (fiscal_period or "").strip() or datetime.now().strftime("%Y%m")
+        out = {
+            "fiscal_period": fp,
+            "abnormal_parts": 0,
+            "eight_d_open": 0,
+            "eight_d_closed": 0,
+            "parts_with_open_8d": 0,
+            "parts_with_closed_8d": 0,
+            "parts_without_8d": 0,
+            "formula": (
+                "异常料号=当月生产报废 distinct 料号；"
+                "已开/已关=这些料号在 8D 库中 status=open/closed 的份数"
+            ),
+            "data_source": "ERP:View_P_Inspection + KB:eightd_reports",
+            "has_data": False,
+        }
+        if not re.fullmatch(r"(19|20)\d{4}", fp):
+            out["data_gap"] = "fiscal_period 格式无效"
+            return out
+        scrap_parts: set[str] = set()
+        if self.erp and self.erp.connected:
+            try:
+                r = self.erp.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT v.MfgPartCode) AS cnt
+                    FROM View_P_Inspection v
+                    WHERE {self._scrap_non_production_sql()}
+                      AND v.FiscalPeriod = ?
+                      AND IFNULL(v.MfgPartCode,'') <> ''
+                      AND IFNULL(v.MfgPartCode,'') NOT LIKE 'TEST-%'
+                    """,
+                    (fp,),
+                )
+                if r.get("success") and r.get("data"):
+                    out["abnormal_parts"] = int(r["data"][0].get("cnt") or 0)
+                r2 = self.erp.execute(
+                    f"""
+                    SELECT DISTINCT TOP 2000 v.MfgPartCode AS part_number
+                    FROM View_P_Inspection v
+                    WHERE {self._scrap_non_production_sql()}
+                      AND v.FiscalPeriod = ?
+                      AND IFNULL(v.MfgPartCode,'') <> ''
+                      AND IFNULL(v.MfgPartCode,'') NOT LIKE 'TEST-%'
+                    """,
+                    (fp,),
+                )
+                for row in (r2.get("data") or []):
+                    code = str(row.get("part_number") or "").strip()
+                    if code:
+                        scrap_parts.add(code)
+            except Exception as e:
+                out["data_gap"] = str(e)
+
+        open_n = closed_n = 0
+        parts_open: set[str] = set()
+        parts_closed: set[str] = set()
+        try:
+            for rp in (self.db.get_8d_list(status="open", limit=500) or []):
+                pn = str(rp.get("part_number") or "").strip()
+                if not pn or pn not in scrap_parts:
+                    continue
+                open_n += 1
+                parts_open.add(pn)
+            for rp in (self.db.get_8d_list(status="closed", limit=500) or []):
+                pn = str(rp.get("part_number") or "").strip()
+                if not pn or pn not in scrap_parts:
+                    continue
+                closed_n += 1
+                parts_closed.add(pn)
+        except Exception as e:
+            out["data_gap"] = ((out.get("data_gap") or "") + "; " + str(e)).strip("; ")
+
+        out["eight_d_open"] = open_n
+        out["eight_d_closed"] = closed_n
+        out["parts_with_open_8d"] = len(parts_open)
+        out["parts_with_closed_8d"] = len(parts_closed)
+        if scrap_parts:
+            out["parts_without_8d"] = max(
+                0, len(scrap_parts) - len(parts_open | parts_closed)
+            )
+        elif out["abnormal_parts"]:
+            # 有计数但未拉到明细时，不做 without 估算
+            out["parts_without_8d"] = None
+        out["has_data"] = bool(out["abnormal_parts"] or open_n or closed_n)
+        return out
+
+    def get_part_spotlight(self, part_number: str, fiscal_period=None) -> dict:
+        """异常料号决策卡：报废/率/主责工序/TOP缺陷/8D建议/损失（有单价才估）。"""
+        part = (part_number or "").strip()
+        fp = (fiscal_period or "").strip() or datetime.now().strftime("%Y%m")
+        empty = {
+            "success": False,
+            "has_data": False,
+            "part_number": part,
+            "fiscal_period": fp,
+            "policy": "仅 ERP/MES 实据；无入库不算报废率；无单价不估损失；禁止编造",
+        }
+        if not part:
+            empty["error"] = "请选择料号"
+            return empty
+        if not re.fullmatch(r"(19|20)\d{4}", fp):
+            empty["error"] = "fiscal_period 格式无效"
+            return empty
+        if not (self.erp and self.erp.connected):
+            empty["error"] = "ERP 未连接"
+            return empty
+
+        scrap = self.get_scrap_analysis(part, None, None, fiscal_period=fp)
+        scrap_pcs = int(scrap.get("total_scrap_pcs") or 0)
+        stock_pcs = int(scrap.get("total_in_stock_pcs") or 0)
+        rate = scrap.get("scrap_rate")
+        reliable = bool(scrap.get("rate_reliable"))
+        defects = list(scrap.get("defect_top10") or [])[:5]
+        processes = list(scrap.get("process_scrap") or [])[:5]
+        primary = processes[0] if processes else None
+        top_defect = defects[0] if defects else None
+
+        # 料名（参数化，禁止拼接料号）
+        part_name = ""
+        try:
+            r_nm = self.erp.execute(
+                """
+                SELECT TOP 1 IFNULL(mp.mfgPartName, '') AS part_name
+                FROM E_JobMfgParts mp
+                WHERE mp.mfgPartCode = ?
+                """,
+                (part,),
+            )
+            if r_nm.get("success") and r_nm.get("data"):
+                part_name = str(r_nm["data"][0].get("part_name") or "").strip()
+        except Exception:
+            pass
+
+        # 损失：仅 materials 有精确单价时估算（参数化）
+        unit_price = None
+        loss_est = None
+        loss_label = "待定价"
+        try:
+            r_p = self.erp.execute(
+                """
+                SELECT TOP 1 purchase_price FROM materials
+                WHERE material_code = ?
+                  AND purchase_price IS NOT NULL AND purchase_price > 0
+                """,
+                (part,),
+            )
+            if r_p.get("success") and r_p.get("data"):
+                unit_price = float(r_p["data"][0].get("purchase_price") or 0)
+                if unit_price > 0 and scrap_pcs > 0:
+                    loss_est = round(unit_price * scrap_pcs, 2)
+                    loss_label = "已核价估算"
+        except Exception:
+            pass
+
+        # 既有 8D
+        open_8d = []
+        closed_8d = []
+        try:
+            for rp in (self.db.get_8d_list(part_number=part, status="open", limit=20) or []):
+                open_8d.append({
+                    "id": rp.get("id"),
+                    "report_no": rp.get("report_no"),
+                    "status": rp.get("status"),
+                    "created_at": rp.get("created_at"),
+                })
+            for rp in (self.db.get_8d_list(part_number=part, status="closed", limit=10) or []):
+                closed_8d.append({
+                    "id": rp.get("id"),
+                    "report_no": rp.get("report_no"),
+                    "status": rp.get("status"),
+                    "closed_at": rp.get("closed_at") or rp.get("updated_at"),
+                })
+        except Exception:
+            pass
+
+        recommend = False
+        recommend_reason = ""
+        if open_8d:
+            recommend = False
+            recommend_reason = f"已有 {len(open_8d)} 份进行中 8D，优先关闭闭环"
+        elif scrap_pcs <= 0:
+            recommend_reason = "本期无报废实据，不建议发起 8D"
+        elif reliable and rate is not None and float(rate) >= float(TARGET_SCRAP_RATE) * 2:
+            recommend = True
+            recommend_reason = (
+                f"报废率 {rate}% ≥ 目标 {TARGET_SCRAP_RATE:g}% 的 2 倍，建议开 8D"
+            )
+        elif scrap_pcs >= 500:
+            recommend = True
+            recommend_reason = f"报废量 {scrap_pcs:,} PCS 较高，建议开 8D 锁定根因"
+        elif reliable and rate is not None and float(rate) > float(TARGET_SCRAP_RATE):
+            recommend = True
+            recommend_reason = (
+                f"报废率 {rate}% 高于目标 {TARGET_SCRAP_RATE:g}%，建议评估是否开 8D"
+            )
+        else:
+            recommend_reason = "未达自动建议阈值，可按现场判断是否开 8D"
+
+        plant_share = None
+        try:
+            plant = self.get_scrap_analysis(None, None, None, fiscal_period=fp)
+            plant_scrap = int(plant.get("total_scrap_pcs") or 0)
+            if plant_scrap > 0 and scrap_pcs > 0:
+                plant_share = round(scrap_pcs * 100.0 / plant_scrap, 2)
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "has_data": bool(scrap_pcs > 0 or stock_pcs > 0),
+            "part_number": part,
+            "part_name": part_name,
+            "fiscal_period": fp,
+            "scrap_pcs": scrap_pcs,
+            "stock_pcs": stock_pcs,
+            "input_pcs": scrap_pcs + stock_pcs,
+            "scrap_rate": rate if reliable else None,
+            "rate_reliable": reliable,
+            "plant_scrap_share_pct": plant_share,
+            "primary_process": (primary or {}).get("process") if primary else None,
+            "primary_process_scrap_pcs": (primary or {}).get("scrap_pcs") if primary else None,
+            "top_defect": (top_defect or {}).get("defect_type") if top_defect else None,
+            "top_defect_scrap_pcs": (top_defect or {}).get("scrap_pcs") if top_defect else None,
+            "defects": defects,
+            "processes": processes,
+            "unit_price": unit_price,
+            "loss_est": loss_est,
+            "loss_label": loss_label,
+            "recommend_8d": recommend,
+            "recommend_reason": recommend_reason,
+            "open_8d": open_8d,
+            "closed_8d": closed_8d,
+            "stock_source": scrap.get("stock_source"),
+            "data_gap": scrap.get("data_gap"),
+            "formula": "报废率=报废/(报废+入库)；无入库不算率；损失=单价×报废PCS（仅有单价）",
+            "data_source": scrap.get("data_source") or "ERP:View_P_Inspection+FGI",
+            "policy": "仅 ERP/MES 实据；无入库不算报废率；无单价不估损失；禁止编造",
+        }
+
+    @staticmethod
+    def kpi_formula_catalog() -> dict:
+        """仪表板口径说明（前端「口径」展开用）。"""
+        return {
+            "input_pcs": {
+                "name": "投入PCS",
+                "formula": "合格数量（入库） + 报废PCS",
+                "source": "FGI 入库 + View_P_Inspection 报废",
+            },
+            "scrap_pcs": {
+                "name": "报废PCS",
+                "formula": "SUM(QtyOfUnit) WHERE InspectionResult=Scrapped（排除非生产/测试/TEST-）",
+                "source": "ERP:View_P_Inspection",
+            },
+            "scrap_rate": {
+                "name": "报废率",
+                "formula": "报废PCS / (报废PCS + 入库PCS)；无入库基数时显示「—」不造率",
+                "source": "ERP 报废 + FGI/工单入库",
+            },
+            "pass_qty": {
+                "name": "合格数量",
+                "formula": "本期生产入库 PCS（无 FGI 时回退工单产出并标注）",
+                "source": "ERP:FGI_StockFormItemWO",
+            },
+            "pass_rate": {
+                "name": "合格率",
+                "formula": "入库PCS / (报废PCS + 入库PCS)；与报废率同源互补",
+                "source": "同报废率分母",
+            },
+        }
+
     def get_dashboard(self, fiscal_period=None):
         """仪表板总览（当月 FiscalPeriod）+ 领导决策层（目标/环比/月趋势/闭环）。"""
         if not fiscal_period:
@@ -3108,6 +4540,14 @@ class PCBQualitySystem:
             "pending_8d": 0,
             "knowledge_stats": self.db.get_learning_stats(),
             "process_overview": [],
+            "kpi_formulas": self.kpi_formula_catalog(),
+            "closed_loop": {
+                "fiscal_period": fiscal_period,
+                "abnormal_parts": 0,
+                "eight_d_open": 0,
+                "eight_d_closed": 0,
+                "has_data": False,
+            },
         }
 
         if self.erp and self.erp.connected:
@@ -3119,16 +4559,20 @@ class PCBQualitySystem:
                 # 工单数优先用 P_WO 当月，避免仅统计报废条码导致偏少
                 wo_count = 0
                 r_wo = self.erp.execute(
-                    f"SELECT COUNT(*) AS TotalWo FROM P_WO WHERE FiscalPeriod = '{fiscal_period}'"
+                    "SELECT COUNT(*) AS TotalWo FROM P_WO WHERE FiscalPeriod = ?",
+                    (fiscal_period,),
                 )
                 if r_wo.get("success") and r_wo.get("data"):
                     wo_count = int(r_wo["data"][0].get("TotalWo") or 0)
                 if wo_count <= 0:
-                    r_wo2 = self.erp.execute(f"""
+                    r_wo2 = self.erp.execute(
+                        """
                         SELECT COUNT(DISTINCT MOBarCode) AS TotalWo
                         FROM View_P_Inspection
-                        WHERE InspectionResult = 'Scrapped' AND FiscalPeriod = '{fiscal_period}'
-                    """)
+                        WHERE InspectionResult = 'Scrapped' AND FiscalPeriod = ?
+                        """,
+                        (fiscal_period,),
+                    )
                     if r_wo2.get("success") and r_wo2.get("data"):
                         wo_count = int(r_wo2["data"][0].get("TotalWo") or 0)
 
@@ -3136,17 +4580,21 @@ class PCBQualitySystem:
                 #   合格数量 = 入库 PCS（良品）
                 #   报废 PCS = MRB 报废
                 #   投入 PCS = 合格 + 报废
-                #   报废率 = 报废 / 投入
-                #   合格率 = 合格 / 投入
+                #   报废率 = 报废 / 投入；仅当入库 > 0 才算可靠
                 pass_qty = int(ti or 0)
                 scrap_qty = int(tr or 0)
                 input_qty = pass_qty + scrap_qty
-                if input_qty > 0:
+                kpi_reliable = bool(pass_qty > 0 and input_qty > 0)
+                if kpi_reliable:
                     scrap_rate = round(scrap_qty * 100.0 / input_qty, 2)
                     pass_rate = round(pass_qty * 100.0 / input_qty, 2)
+                elif scrap_qty > 0:
+                    # 有报废但无入库基数：不给 100% 伪高
+                    scrap_rate = None
+                    pass_rate = None
                 else:
-                    scrap_rate = float(scrap_data.get("scrap_rate", 0) or 0)
-                    pass_rate = round(max(0.0, 100.0 - scrap_rate), 2)
+                    scrap_rate = 0
+                    pass_rate = 0
                 result["kpi"] = {
                     "total_wo": wo_count,
                     "total_input": input_qty,
@@ -3154,31 +4602,40 @@ class PCBQualitySystem:
                     "reject_rate": scrap_rate,
                     "pass_qty": pass_qty,
                     "pass_rate": pass_rate,
+                    "rate_reliable": kpi_reliable,
+                    "stock_source": scrap_data.get("stock_source") or "none",
                 }
 
-                # TOP报废料号（当月）
-                r_parts = self.erp.execute(f"""
+                # TOP报废料号（当月，统一生产口径：排除非量产工序/项目/测试/TEST-）
+                r_parts = self.erp.execute(
+                    f"""
                     SELECT TOP 10
                         v.MfgPartCode AS PartNumber,
                         IFNULL(MAX(mp.mfgPartName), v.MfgPartCode) AS PartName,
                         SUM(v.QtyOfUnit) AS TotalReject
                     FROM View_P_Inspection v
                     LEFT JOIN E_JobMfgParts mp ON mp.mfgPartCode = v.MfgPartCode
-                    WHERE v.InspectionResult = 'Scrapped'
-                      AND v.FiscalPeriod = '{fiscal_period}'
+                    WHERE {self._scrap_non_production_sql()}
+                      AND v.FiscalPeriod = ?
                       AND v.MfgPartCode IS NOT NULL AND v.MfgPartCode <> ''
                     GROUP BY v.MfgPartCode
                     ORDER BY SUM(v.QtyOfUnit) DESC
-                """)
+                    """,
+                    (fiscal_period,),
+                )
                 stock_map = {}
-                r_stock = self.erp.execute(f"""
+                r_stock = self.erp.execute(
+                    f"""
                     SELECT mp.mfgPartCode AS PartNumber, SUM(sfiwo.qtyOfPCS) AS TotalInput
                     FROM FGI_StockFormItemWO sfiwo
                     INNER JOIN P_WO wo ON sfiwo.woId = wo.recId
                     INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
-                    WHERE wo.FiscalPeriod = '{fiscal_period}'
+                    WHERE wo.FiscalPeriod = ?
+                      AND {self._scrap_part_excluded_sql('mp.mfgPartCode')}
                     GROUP BY mp.mfgPartCode
-                """)
+                    """,
+                    (fiscal_period,),
+                )
                 if r_stock.get("success") and r_stock.get("data"):
                     for row in r_stock["data"]:
                         stock_map[row.get("PartNumber", "")] = int(row.get("TotalInput") or 0)
@@ -3207,21 +4664,26 @@ class PCBQualitySystem:
                     for pn, inp in sorted(stock_map.items(), key=lambda x: -x[1])[:20]:
                         if pn in existing:
                             continue
-                        r_one = self.erp.execute(f"""
+                        r_one = self.erp.execute(
+                            f"""
                             SELECT IFNULL(SUM(QtyOfUnit),0) AS TotalReject,
-                                   IFNULL(MAX(mp.mfgPartName), '{pn}') AS PartName
+                                   IFNULL(MAX(mp.mfgPartName), ?) AS PartName
                             FROM View_P_Inspection v
                             LEFT JOIN E_JobMfgParts mp ON mp.mfgPartCode = v.MfgPartCode
-                            WHERE v.InspectionResult='Scrapped'
-                              AND v.FiscalPeriod='{fiscal_period}'
-                              AND v.MfgPartCode='{pn}'
-                        """)
+                            WHERE {self._scrap_non_production_sql()}
+                              AND v.FiscalPeriod=?
+                              AND v.MfgPartCode=?
+                            """,
+                            (pn, fiscal_period, pn),
+                        )
                         reject = 0
                         pname = pn
                         if r_one.get("success") and r_one.get("data"):
                             reject = int(float(r_one["data"][0].get("TotalReject") or 0))
                             pname = r_one["data"][0].get("PartName") or pn
                         if reject <= 0:
+                            continue
+                        if inp <= 0:  # 无入库基数不产出伪 100% 报废率
                             continue
                         rate = round(reject * 100.0 / (reject + inp), 2)
                         with_stock.append({
@@ -3274,19 +4736,81 @@ class PCBQualitySystem:
 
         if self.mes and self.mes.connected:
             try:
-                r = self.mes.execute("""
-                    SELECT TOP 8
+                min_n = int(getattr(self.engine, "ALERT_MIN_INSPECT", 15))
+                # 两种口径分开算，禁止用「检验次数通过率」冒充「单板一次通过率」：
+                #   InspectionPassRate = 合格检验笔数 / 检验笔数（同一块板多次检验各算一次）
+                #   UnitFirstPassRate  = 该板在该工序首次检验即合格的条码数 / 受检条码数（去重）
+                r = self.mes.execute(f"""
+                    SELECT
                         ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
                         COUNT(*) AS InspectCount,
-                        CAST(SUM(CASE WHEN r.CRESULT=1 THEN 1 ELSE 0 END)*100.0/COUNT(*) AS DECIMAL(5,2)) AS PassRate
+                        SUM(CASE WHEN r.CRESULT=1 THEN 1 ELSE 0 END) AS PassCount,
+                        CAST(SUM(CASE WHEN r.CRESULT=1 THEN 1 ELSE 0 END)*100.0/COUNT(*) AS DECIMAL(5,2)) AS InspectionPassRate
                     FROM TBL_QM_INSPECT_RECORD r
                     LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
                     WHERE r.CRESULT IS NOT NULL
                     GROUP BY p.CPROCESS_NAME
+                    HAVING COUNT(*) >= {min_n}
                     ORDER BY InspectCount DESC
                 """)
                 if r.get("success"):
-                    result["process_overview"] = r.get("data", [])
+                    rows = r.get("data", []) or []
+                    unit_map = {}
+                    r_unit = self.mes.execute("""
+                        WITH ranked AS (
+                            SELECT r.CPROCESS_ID, r.CSCAN_BARCODE, r.CRESULT,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY r.CPROCESS_ID, r.CSCAN_BARCODE
+                                       ORDER BY r.CCREATE_DATE, r.CID
+                                   ) AS rn
+                            FROM TBL_QM_INSPECT_RECORD r
+                            WHERE r.CRESULT IS NOT NULL
+                              AND IFNULL(r.CSCAN_BARCODE, '') <> ''
+                        )
+                        SELECT ISNULL(p.CPROCESS_NAME, '') AS ProcessName,
+                               COUNT(*) AS UnitCount,
+                               SUM(CASE WHEN x.rn=1 AND x.CRESULT=1 THEN 1 ELSE 0 END) AS UnitFirstPassCount
+                        FROM ranked x
+                        LEFT JOIN TBL_BD_PROCESS p ON x.CPROCESS_ID = p.CID
+                        GROUP BY p.CPROCESS_NAME
+                    """)
+                    if r_unit.get("success"):
+                        for u in (r_unit.get("data") or []):
+                            unit_map[u.get("ProcessName") or ""] = u
+                    else:
+                        result["process_overview_unit_gap"] = (
+                            "单板一次通过率未计算：" + str(r_unit.get("error") or "条码去重查询失败")
+                        )
+                    for row in rows:
+                        insp_rate = row.get("InspectionPassRate")
+                        if insp_rate is None:
+                            insp_count = int(row.get("InspectCount") or 0)
+                            insp_rate = (
+                                round(int(row.get("PassCount") or 0) * 100.0 / insp_count, 2)
+                                if insp_count else None
+                            )
+                        row["InspectionPassRate"] = (
+                            round(float(insp_rate), 2) if insp_rate is not None else None
+                        )
+                        row["PassRate"] = row["InspectionPassRate"]  # 兼容旧前端字段（检验通过率）
+                        u = unit_map.get(row.get("ProcessName") or "") or {}
+                        units = int(u.get("UnitCount") or 0)
+                        first_pass = int(u.get("UnitFirstPassCount") or 0)
+                        row["UnitCount"] = units
+                        row["UnitFirstPassCount"] = first_pass
+                        row["UnitFirstPassRate"] = (
+                            round(first_pass * 100.0 / units, 2) if units else None
+                        )
+                    # 只取样本量足够的工序按检验通过率升序，避免 1 次检验即垫底
+                    rows = [x for x in rows if (x.get("ProcessName") or "").strip()]
+                    rows.sort(key=lambda x: float(x.get("PassRate") or 100))
+                    result["process_overview"] = rows[:8]
+                    result["process_overview_min_sample"] = min_n
+                    result["process_overview_basis"] = (
+                        "检验通过率=合格检验笔数/检验笔数；"
+                        "单板一次通过率=该工序首次检验即合格的条码数/受检条码数（按条码去重）；"
+                        "统计范围为 MES 全周期（不限当月）"
+                    )
             except Exception as e:
                 logger.warning(f"MES仪表板数据: {e}")
 
@@ -3294,32 +4818,41 @@ class PCBQualitySystem:
         if result["top_defect_parts"]:
             result["ranking_mode"] = "scrap_parts"
             result["ranking_title"] = f"TOP报废料号"
+            result["ranking_basis"] = "ERP 检验报废实绩（View_P_Inspection）"
         elif result["top_defect_items"]:
             result["ranking_mode"] = "defect_items"
             result["ranking_title"] = f"TOP报废缺陷"
+            result["ranking_basis"] = "ERP 检验报废缺陷项"
         elif result["process_overview"]:
-            # 按良率升序取关注工序
-            low = sorted(
-                [p for p in result["process_overview"] if p.get("ProcessName")],
-                key=lambda x: float(x.get("PassRate") or 100),
-            )[:8]
+            # 没有任何 ERP 报废实绩时，降级展示 MES 工序合格率（非报废口径）
+            low = result["process_overview"][:8]
             result["ranking_mode"] = "low_yield"
-            result["ranking_title"] = "关注工序（良率偏低）"
+            result["ranking_title"] = "关注工序（MES 检验通过率偏低）"
+            result["ranking_basis"] = (
+                f"{result.get('process_overview_basis') or 'MES 工序检验通过率'}；"
+                f"样本≥{result.get('process_overview_min_sample', 15)} 笔；"
+                "非报废 PCS 口径"
+            )
             result["top_defect_parts"] = [
                 {
                     "PartNumber": p.get("ProcessName"),
                     "PartName": f"检验 {int(p.get('InspectCount') or 0)} 次",
-                    "TotalReject": int(p.get("InspectCount") or 0) - int(
-                        float(p.get("PassRate") or 0) / 100.0 * float(p.get("InspectCount") or 0)
+                    "TotalReject": int(
+                        float(p.get("InspectCount") or 0) - float(p.get("PassCount") or 0)
                     ),
                     "TotalInput": int(p.get("InspectCount") or 0),
-                    "RejectRate": round(100 - float(p.get("PassRate") or 0), 2),
+                    "RejectRate": round(100 - float(p.get("InspectionPassRate") or 0), 2),
+                    "InspectionPassRate": p.get("InspectionPassRate"),
+                    "UnitFirstPassRate": p.get("UnitFirstPassRate"),
+                    "is_process": True,
+                    "record_type": "process_yield",
                 }
                 for p in low
             ]
         else:
             result["ranking_mode"] = "empty"
             result["ranking_title"] = "品质关注项"
+            result["ranking_basis"] = "本期无 ERP 报废或 MES 工序数据"
 
         result["yield_trends"] = self.get_yield_trends(day_count=30)
         scrap_trends = self.get_scrap_trends(day_count=30)
@@ -3339,8 +4872,11 @@ class PCBQualitySystem:
         }
         result["targets"] = targets
 
-        cur_rate = float((result.get("kpi") or {}).get("reject_rate") or 0)
-        cur_pass = float((result.get("kpi") or {}).get("pass_rate") or 0)
+        kpi_rate = (result.get("kpi") or {}).get("reject_rate")
+        kpi_pass = (result.get("kpi") or {}).get("pass_rate")
+        kpi_reliable = bool((result.get("kpi") or {}).get("rate_reliable"))
+        cur_rate = float(kpi_rate) if kpi_rate is not None else 0.0
+        cur_pass = float(kpi_pass) if kpi_pass is not None else 0.0
         cur_input = int((result.get("kpi") or {}).get("total_input") or 0)
         cur_scrap = int((result.get("kpi") or {}).get("total_reject") or 0)
 
@@ -3371,11 +4907,11 @@ class PCBQualitySystem:
                 mom["input_prev"] = p_input
                 mom["scrap_pcs_prev"] = p_scrap
                 mom["prev_rate_reliable"] = prev_reliable
-                if p_rate is not None:
+                if p_rate is not None and kpi_reliable:
                     mom["scrap_rate_delta"] = round(cur_rate - p_rate, 2)
-                if p_pass is not None:
+                if p_pass is not None and kpi_reliable:
                     mom["pass_rate_delta"] = round(cur_pass - p_pass, 2)
-                if p_input > 0 and p_stock > 0:
+                if p_input > 0 and p_stock > 0 and kpi_reliable:
                     mom["input_delta_pct"] = round((cur_input - p_input) * 100.0 / p_input, 1)
                 mom["scrap_pcs_delta"] = cur_scrap - p_scrap
                 if not prev_reliable:
@@ -3393,15 +4929,25 @@ class PCBQualitySystem:
         result["pending_8d"] = mgmt.get("pending_8d", 0)
         result["critical_alerts"] = mgmt.get("critical_alerts", 0)
 
-        # 目标达成状态
-        vs_target = {
-            "scrap_vs_target": round(cur_rate - TARGET_SCRAP_RATE, 2),
-            "scrap_status": (
+        # 目标达成状态（无入库基数→na，不判定达标/超标）
+        if not kpi_reliable:
+            scrap_status = "na"
+            scrap_vs_target = None
+        else:
+            scrap_status = (
                 "ok" if cur_rate <= TARGET_SCRAP_RATE
                 else ("warn" if cur_rate <= WARN_SCRAP_RATE else "crit")
-            ),
-            "pass_vs_target": round(cur_pass - TARGET_PASS_RATE, 2),
-            "pass_status": "ok" if cur_pass >= TARGET_PASS_RATE else "warn",
+            )
+            scrap_vs_target = round(cur_rate - TARGET_SCRAP_RATE, 2)
+        pass_status = "na" if not kpi_reliable else (
+            "ok" if cur_pass >= TARGET_PASS_RATE else "warn"
+        )
+        vs_target = {
+            "scrap_vs_target": scrap_vs_target,
+            "scrap_status": scrap_status,
+            "scrap_reliable": kpi_reliable,
+            "pass_vs_target": round(cur_pass - TARGET_PASS_RATE, 2) if kpi_reliable else None,
+            "pass_status": pass_status,
         }
         result["vs_target"] = vs_target
 
@@ -3412,16 +4958,19 @@ class PCBQualitySystem:
         achieve_items.append({
             "key": "scrap_rate",
             "name": "报废率",
-            "value": cur_rate,
+            "value": cur_rate if kpi_reliable else None,
             "unit": "%",
             "target": TARGET_SCRAP_RATE,
             "target_text": f"≤{TARGET_SCRAP_RATE:g}%",
             "delta": vs_target["scrap_vs_target"],
             "status": scrap_st,
-            "status_label": {"ok": "达标", "warn": "关注", "crit": "严重"}.get(scrap_st, "—"),
+            "status_label": {
+                "ok": "达标", "warn": "关注", "crit": "严重", "na": "缺入库基数"
+            }.get(scrap_st, "—"),
             "hint": (
                 f"较目标 {vs_target['scrap_vs_target']:+.2f}pp"
-                if vs_target.get("scrap_vs_target") is not None else "—"
+                if vs_target.get("scrap_vs_target") is not None
+                else "无入库基数，不计算报废率"
             ),
         })
         # 2) 合格率
@@ -3429,16 +4978,19 @@ class PCBQualitySystem:
         achieve_items.append({
             "key": "pass_rate",
             "name": "合格率",
-            "value": cur_pass,
+            "value": cur_pass if kpi_reliable else None,
             "unit": "%",
             "target": TARGET_PASS_RATE,
             "target_text": f"≥{TARGET_PASS_RATE:g}%",
             "delta": vs_target["pass_vs_target"],
             "status": pass_st,
-            "status_label": {"ok": "达标", "warn": "未达标", "crit": "严重"}.get(pass_st, "—"),
+            "status_label": {
+                "ok": "达标", "warn": "未达标", "crit": "严重", "na": "缺入库基数"
+            }.get(pass_st, "—"),
             "hint": (
                 f"较目标 {vs_target['pass_vs_target']:+.2f}pp"
-                if vs_target.get("pass_vs_target") is not None else "—"
+                if vs_target.get("pass_vs_target") is not None
+                else "无入库基数，不计算合格率"
             ),
         })
         # 3) 报废率环比（改善=达标，恶化=关注/严重）
@@ -3566,13 +5118,9 @@ class PCBQualitySystem:
         # 7) 客诉 / COPQ
         copq = {}
         try:
-            # 与 FiscalPeriod 对齐：当月 1 日 → 下月 1 日
-            y, m = int(str(fiscal_period)[:4]), int(str(fiscal_period)[4:6])
-            start_m = f"{y:04d}-{m:02d}-01"
-            if m == 12:
-                end_m = f"{y + 1:04d}-01-01"
-            else:
-                end_m = f"{y:04d}-{m + 1:02d}-01"
+            # 与 FiscalPeriod 对齐：当月 1 日 → 当月最后一日（COPQ 内部转右开）
+            start_m = f"{str(fiscal_period)[:4]}-{str(fiscal_period)[4:6]}-01"
+            end_m = _month_end_inclusive(str(fiscal_period))
             copq = self.get_copq_analysis(start_date=start_m, end_date=end_m)
         except Exception as e:
             logger.warning("总览拉取 COPQ 失败: %s", e)
@@ -3872,11 +5420,19 @@ class PCBQualitySystem:
 
         # 决策简报（纯实数叙事，禁止编造）
         briefing_lines = []
-        briefing_lines.append(
-            f"【{period_label}】投入 {cur_input:,} PCS，报废 {cur_scrap:,} PCS，"
-            f"报废率 {cur_rate:.2f}%（目标 ≤{TARGET_SCRAP_RATE:g}%），合格率 {cur_pass:.2f}%。"
-        )
-        if vs_target["scrap_status"] == "ok":
+        if kpi_reliable:
+            briefing_lines.append(
+                f"【{period_label}】投入 {cur_input:,} PCS，报废 {cur_scrap:,} PCS，"
+                f"报废率 {cur_rate:.2f}%（目标 ≤{TARGET_SCRAP_RATE:g}%），合格率 {cur_pass:.2f}%。"
+            )
+        else:
+            briefing_lines.append(
+                f"【{period_label}】入库 0 PCS、报废 {cur_scrap:,} PCS：缺生产入库基数，"
+                "报废率/合格率不计算（请在 ERP 补充 FGI 生产入库）。"
+            )
+        if not kpi_reliable:
+            pass
+        elif vs_target["scrap_status"] == "ok":
             briefing_lines.append(f"报废率低于目标 {TARGET_SCRAP_RATE:g}%，达标。")
         elif vs_target["scrap_status"] == "warn":
             briefing_lines.append(
@@ -3904,11 +5460,18 @@ class PCBQualitySystem:
         top_parts = result.get("top_defect_parts") or []
         if top_parts:
             p0 = top_parts[0]
-            briefing_lines.append(
-                f"TOP1 报废料号：{p0.get('PartNumber')}（{int(p0.get('TotalReject') or 0):,} PCS"
-                + (f"，料号报废率 {p0.get('RejectRate')}%" if p0.get("RejectRate") is not None else "")
-                + "）。"
-            )
+            if result.get("ranking_mode") == "low_yield":
+                briefing_lines.append(
+                    f"关注工序 TOP1：{p0.get('PartNumber')}（MES 检验 "
+                    f"{int(p0.get('TotalInput') or 0):,} 次，合格率 "
+                    f"{round(100 - float(p0.get('RejectRate') or 0), 2)}%）。"
+                )
+            else:
+                briefing_lines.append(
+                    f"TOP1 报废料号：{p0.get('PartNumber')}（{int(p0.get('TotalReject') or 0):,} PCS"
+                    + (f"，料号报废率 {p0.get('RejectRate')}%" if p0.get("RejectRate") is not None else "")
+                    + "）。"
+                )
         top_items = result.get("top_defect_items") or []
         if top_items:
             d0 = top_items[0]
@@ -4011,6 +5574,20 @@ class PCBQualitySystem:
             "仅品质指标：报废/合格/环比/预警·8D时效/IPQC/COPQ/SPC/IQC/FQC/一次交验/复检/DPPM；"
             "不含设备OEE与产能稼动；报废成本仅 ERP 精确单价；禁止编造"
         )
+        result["kpi_formulas"] = self.kpi_formula_catalog()
+        try:
+            result["closed_loop"] = self.get_closed_loop_stats(fiscal_period)
+        except Exception as e:
+            result["closed_loop"] = {
+                "fiscal_period": fiscal_period,
+                "abnormal_parts": 0,
+                "eight_d_open": 0,
+                "eight_d_closed": 0,
+                "has_data": False,
+                "data_gap": str(e),
+            }
+        if result.get("ranking_mode") == "scrap_parts" and (result.get("top_defect_parts") or []):
+            result["spotlight_part"] = (result["top_defect_parts"][0] or {}).get("PartNumber")
         return result
 
     def _qi_table_cols(self, db) -> set:
@@ -4050,13 +5627,23 @@ class PCBQualitySystem:
         return "'未知'"
 
     def get_yield_trends(self, day_count=30):
-        """良率趋势：整体 / 工序 / 客户 / 关键指标（报废率、检验量）"""
+        """良率趋势：整体 / 工序 / 客户 / 关键指标。
+
+        仅用 MES 检验实据 + ERP 报废/入库实据；禁止 quality_metrics 造数续轴。
+        """
         empty = {
             "days": [],
             "overall": [],
             "processes": {},
             "customers": {},
-            "metrics": {"inspect_count": [], "scrap_rate": [], "ng_rate": []},
+            "metrics": {
+                "inspect_count": [], "scrap_rate": [], "ng_rate": [],
+                "formula": (
+                    "不良率=MES检验不合格笔数/检验笔数；"
+                    "报废率=ERP报废PCS/(报废+入库PCS)；无入库日不计算报废率"
+                ),
+                "data_source": "MES:quality_inspection_records + ERP:View_P_Inspection/FGI",
+            },
             "process_names": [],
             "customer_names": [],
         }
@@ -4103,44 +5690,53 @@ class PCBQualitySystem:
                         "source": "inspection",
                     }
 
-            # 2) quality_metrics 补齐断档日（生产库检验常停在更早日期，metrics 仍持续更新）
-            met_map = {}
-            rm = db.execute(f"""
-                SELECT record_date AS day,
-                       SUM(COALESCE(total_inspected,0)) AS total,
-                       SUM(COALESCE(good_count,0)) AS good_cnt,
-                       SUM(COALESCE(defect_count,0)) AS defect_cnt
-                FROM quality_metrics
-                WHERE record_date IS NOT NULL
-                  AND record_date >= date('now', '-{n} days')
-                GROUP BY record_date
-                ORDER BY day
-            """)
-            if rm.get("success") and rm.get("data"):
-                for row in rm["data"]:
-                    day = row.get("day")
-                    if not day:
-                        continue
-                    total = int(row.get("total") or 0)
-                    good = int(row.get("good_cnt") or 0)
-                    defect = int(row.get("defect_cnt") or 0)
-                    if total <= 0:
-                        continue
-                    met_map[day] = {
-                        "yield": round(good * 100.0 / total, 2),
-                        "total": total,
-                        "ng_rate": round(defect * 100.0 / total, 2),
-                        "source": "metrics",
-                    }
+            # 趋势轴与整体良率：仅 quality_inspection_records（MES 检验桥接实据）
+            # 禁止用 quality_metrics 造数续轴（常见于无检验的「蚀刻」伪日汇总）
+            day_list = sorted(insp_map.keys())
+            overall = [insp_map[d]["yield"] for d in day_list]
 
-            day_list = sorted(set(insp_map) | set(met_map))
-            overall, inspect_count, ng_rate = [], [], []
-            for day in day_list:
-                # 有检验实据优先；断档日用 metrics 续上，避免趋势图停在过期日期
-                row = insp_map.get(day) or met_map.get(day)
-                overall.append(row["yield"])
-                inspect_count.append(row["total"])
-                ng_rate.append(row["ng_rate"])
+            # 关键指标：
+            #   不良率/检验量 ← MES 检验笔数
+            #   报废率 ← ERP 报废PCS/(报废+入库PCS)；无入库日记 None（不伪造）
+            inspect_count = [insp_map[d]["total"] for d in day_list]
+            ng_rate = [insp_map[d]["ng_rate"] for d in day_list]
+            scrap_rate = [None] * len(day_list)
+            if self.erp and self.erp.connected and day_list:
+                scrap_filter = self._scrap_non_production_sql()
+                rs = self.erp.execute(f"""
+                    SELECT strftime('%Y-%m-%d', v.CreateDate) AS day,
+                           SUM(v.QtyOfUnit) AS scrap
+                    FROM View_P_Inspection v
+                    WHERE {scrap_filter}
+                      AND v.CreateDate >= date('now', '-{n} days')
+                    GROUP BY day ORDER BY day
+                """)
+                scrap_map = {
+                    row.get("day"): float(row.get("scrap") or 0)
+                    for row in (rs.get("data") or []) if row.get("day")
+                }
+                rst = self.erp.execute(f"""
+                    SELECT strftime('%Y-%m-%d', sfi.stockDate) AS day,
+                           SUM(sfiwo.qtyOfPCS) AS stock
+                    FROM FGI_StockFormItemWO sfiwo
+                    INNER JOIN FGI_StockFormItem sfi ON sfiwo.stockFormItemId = sfi.recId
+                    INNER JOIN P_WO wo ON sfiwo.woId = wo.recId
+                    INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
+                    WHERE sfi.stockDate >= date('now', '-{n} days')
+                      AND {self._scrap_part_excluded_sql('mp.mfgPartCode')}
+                    GROUP BY day ORDER BY day
+                """)
+                stock_map = {
+                    row.get("day"): float(row.get("stock") or 0)
+                    for row in (rst.get("data") or []) if row.get("day")
+                }
+                scrap_rate = []
+                for d in day_list:
+                    sc = scrap_map.get(d, 0.0)
+                    st = stock_map.get(d, 0.0)
+                    scrap_rate.append(
+                        round(sc * 100.0 / (sc + st), 2) if st > 0 else None
+                    )
 
             r_proc = db.execute(f"""
                 SELECT {proc_expr} AS pname, COUNT(*) AS c
@@ -4148,26 +5744,18 @@ class PCBQualitySystem:
                 WHERE inspected_at >= date('now', '-{n} days')
                 GROUP BY pname ORDER BY c DESC LIMIT 5
             """)
-            process_names = [x.get("pname") for x in (r_proc.get("data") or []) if x.get("pname")]
-            # metrics 工序补齐：检验侧工序不足时并入产量 metrics 的 TOP 工序
-            if len(process_names) < 5:
-                rpm = db.execute(f"""
-                    SELECT process AS pname, SUM(COALESCE(total_inspected,0)) AS c
-                    FROM quality_metrics
-                    WHERE record_date >= date('now', '-{n} days')
-                      AND process IS NOT NULL AND process <> ''
-                    GROUP BY process ORDER BY c DESC LIMIT 5
-                """)
-                for x in (rpm.get("data") or []):
-                    pname = x.get("pname")
-                    if pname and pname not in process_names:
-                        process_names.append(pname)
-                    if len(process_names) >= 5:
-                        break
+            process_names = []
+            for x in (r_proc.get("data") or []):
+                pname = normalize_process_name(x.get("pname"))
+                if pname and pname not in process_names:
+                    process_names.append(pname)
+            # 只保留检验实据中出现的工序，不把无数据的标准名硬塞进趋势图
+            process_names = process_names[:5]
 
             processes = {}
             for pname in process_names:
-                safe = pname.replace("'", "''")
+                aliases = aliases_including_self(pname)
+                in_list = "', '".join(a.replace("'", "''") for a in aliases)
                 rp = db.execute(f"""
                     SELECT strftime('%Y-%m-%d', inspected_at) AS day,
                            COUNT(*) AS total,
@@ -4176,28 +5764,13 @@ class PCBQualitySystem:
                                 THEN 1 ELSE 0 END) AS pass_cnt
                     FROM quality_inspection_records
                     WHERE inspected_at >= date('now', '-{n} days')
-                      AND {proc_expr} = '{safe}'
+                      AND {proc_expr} IN ('{in_list}')
                     GROUP BY day ORDER BY day
                 """)
                 series = {row.get("day"): round(
                     int(row.get("pass_cnt") or 0) * 100.0 / (int(row.get("total") or 1)), 2
                 ) for row in (rp.get("data") or [])}
-                # metrics 同名工序补缺口
-                rpm = db.execute(f"""
-                    SELECT record_date AS day,
-                           SUM(COALESCE(total_inspected,0)) AS total,
-                           SUM(COALESCE(good_count,0)) AS good_cnt
-                    FROM quality_metrics
-                    WHERE record_date >= date('now', '-{n} days')
-                      AND process = '{safe}'
-                    GROUP BY record_date
-                """)
-                for row in (rpm.get("data") or []):
-                    day = row.get("day")
-                    total = int(row.get("total") or 0)
-                    if not day or total <= 0 or day in series:
-                        continue
-                    series[day] = round(int(row.get("good_cnt") or 0) * 100.0 / total, 2)
+                # 仅检验实据；不用 quality_metrics 续无检验日
                 processes[pname] = [series.get(d) for d in day_list]
 
             r_cust = db.execute(f"""
@@ -4227,35 +5800,6 @@ class PCBQualitySystem:
                 ) for row in (rc.get("data") or [])}
                 customers[ccode] = [series.get(d) for d in day_list]
 
-            # 报废率必须用 ERP 报废÷(报废+入库)，禁止用 MES 检验笔数当投入基数
-            scrap_rate = []
-            if self.erp and self.erp.connected and day_list:
-                rs = self.erp.execute(f"""
-                    SELECT strftime('%Y-%m-%d', CreateDate) AS day,
-                           SUM(QtyOfUnit) AS scrap
-                    FROM View_P_Inspection
-                    WHERE InspectionResult='Scrapped'
-                      AND CreateDate >= date('now', '-{n} days')
-                    GROUP BY day ORDER BY day
-                """)
-                scrap_map = {row.get("day"): float(row.get("scrap") or 0)
-                             for row in (rs.get("data") or [])}
-                rst = self.erp.execute(f"""
-                    SELECT strftime('%Y-%m-%d', sfi.stockDate) AS day,
-                           SUM(sfiwo.qtyOfPCS) AS stock
-                    FROM FGI_StockFormItemWO sfiwo
-                    INNER JOIN FGI_StockFormItem sfi ON sfiwo.stockFormItemId = sfi.recId
-                    WHERE sfi.stockDate >= date('now', '-{n} days')
-                    GROUP BY day ORDER BY day
-                """)
-                stock_map = {row.get("day"): float(row.get("stock") or 0)
-                             for row in (rst.get("data") or [])}
-                for d in day_list:
-                    sc = scrap_map.get(d, 0)
-                    st = stock_map.get(d, 0)
-                    base = sc + st
-                    scrap_rate.append(round(sc * 100.0 / base, 2) if base > 0 else 0)
-
             return {
                 "days": day_list,
                 "overall": overall,
@@ -4265,6 +5809,12 @@ class PCBQualitySystem:
                     "inspect_count": inspect_count,
                     "scrap_rate": scrap_rate,
                     "ng_rate": ng_rate,
+                    "formula": (
+                        "不良率=MES检验不合格笔数/检验笔数；"
+                        "报废率=ERP报废PCS/(报废+入库PCS)；"
+                        "无入库日不计算报废率"
+                    ),
+                    "data_source": "MES:quality_inspection_records + ERP:View_P_Inspection/FGI",
                 },
                 "process_names": process_names,
                 "customer_names": customer_names,
@@ -4273,8 +5823,19 @@ class PCBQualitySystem:
             logger.warning(f"良率趋势分析失败: {e}")
             return empty
 
+    # 非量产料号前缀（如 TEST-E200）：不得进入生产报废率/预警/8D 口径
+    SCRAP_EXCLUDED_PART_PREFIXES = ("TEST-",)
+
+    def _scrap_part_excluded_sql(self, column: str = "v.MfgPartCode") -> str:
+        """生产料号排除条件（TEST- 等非量产料号）。"""
+        return " AND ".join(
+            f"ISNULL({column}, '') NOT LIKE '{p}%'" for p in self.SCRAP_EXCLUDED_PART_PREFIXES
+        )
+
     def _scrap_non_production_sql(self):
-        """与 get_scrap_analysis 一致的非量产报废排除条件（View_P_Inspection 别名 v）。"""
+        """生产报废统一口径（View_P_Inspection 别名 v）：
+        仅 Scrapped；排除非生产工序/项目、测试工序及项目、TEST- 非量产料号。
+        """
         non_production_processes = [
             '样板组', '品质部', '工艺部', '设备部', '销售部', '测试划线', 'FQC', 'FQC(内部客检)', 'FQC2'
         ]
@@ -4286,7 +5847,8 @@ class PCBQualitySystem:
             f"AND ISNULL(v.InspectionProcess, '') NOT IN ('{np_proc}') "
             f"AND ISNULL(v.InspectionItem, '') NOT IN ('{np_item}') "
             "AND ISNULL(v.InspectionProcess, '') <> '测试' "
-            "AND ISNULL(v.InspectionItem, '') NOT LIKE '%测试%'"
+            "AND ISNULL(v.InspectionItem, '') NOT LIKE '%测试%' "
+            f"AND {self._scrap_part_excluded_sql('v.MfgPartCode')}"
         )
 
     def get_scrap_trends(self, day_count=30):
@@ -4336,7 +5898,9 @@ class PCBQualitySystem:
                 FROM FGI_StockFormItemWO sfiwo
                 INNER JOIN FGI_StockFormItem sfi ON sfiwo.stockFormItemId = sfi.recId
                 INNER JOIN P_WO wo ON sfiwo.woId = wo.recId
+                INNER JOIN E_JobMfgParts mp ON wo.mfgPartId = mp.recId
                 WHERE sfi.stockDate >= '{start_d}'
+                  AND {self._scrap_part_excluded_sql('mp.mfgPartCode')}
                 GROUP BY day ORDER BY day
             """)
             stock_map = {
@@ -4356,9 +5920,9 @@ class PCBQualitySystem:
                 else:
                     overall_rate.append(None)
 
-            # TOP 工序（近 N 日报废量）
+            # 工序报废：归一到标准 PCB 目录后取 TOP（含旧名别名）
             r_proc = self.erp.execute(f"""
-                SELECT TOP 5
+                SELECT
                     ISNULL(NULLIF(v.InspectionProcess, ''), '未知') AS pname,
                     SUM(v.QtyOfUnit) AS scrap
                 FROM View_P_Inspection v
@@ -4367,17 +5931,27 @@ class PCBQualitySystem:
                 GROUP BY ISNULL(NULLIF(v.InspectionProcess, ''), '未知')
                 ORDER BY SUM(v.QtyOfUnit) DESC
             """)
-            process_names = [x.get("pname") for x in (r_proc.get("data") or []) if x.get("pname")]
+            scrap_by_std: dict[str, float] = {}
+            for x in (r_proc.get("data") or []):
+                std = normalize_process_name(x.get("pname")) or "待确认工序"
+                scrap_by_std[std] = scrap_by_std.get(std, 0) + float(x.get("scrap") or 0)
+            process_names = [
+                p for p, _ in sorted(scrap_by_std.items(), key=lambda kv: -kv[1])
+                if p
+            ][:5]
+            if not process_names:
+                process_names = [p for p in STANDARD_PROCESSES if p != "待确认工序"][:4]
             processes = {}
             for pname in process_names:
-                safe = str(pname).replace("'", "''")
+                aliases = aliases_including_self(pname)
+                in_list = "', '".join(a.replace("'", "''") for a in aliases)
                 rp = self.erp.execute(f"""
                     SELECT strftime('%Y-%m-%d', v.CreateDate) AS day,
                            SUM(v.QtyOfUnit) AS scrap
                     FROM View_P_Inspection v
                     WHERE {scrap_filter}
                       AND v.CreateDate >= '{start_d}'
-                      AND ISNULL(NULLIF(v.InspectionProcess, ''), '未知') = '{safe}'
+                      AND ISNULL(NULLIF(v.InspectionProcess, ''), '未知') IN ('{in_list}')
                     GROUP BY day ORDER BY day
                 """)
                 series = {
@@ -4459,18 +6033,23 @@ class PCBQualitySystem:
             return result
 
         if not start_date and not end_date:
-            # 默认近 90 天，覆盖当月客诉与环比
+            # 默认近 90 天（含今天），覆盖当月客诉与环比
             end = datetime.now().date()
             start = end - timedelta(days=90)
             start_date = start.isoformat()
-            end_date = (end + timedelta(days=1)).isoformat()
+            end_date = end.isoformat()
 
-        result["date_filter"] = {"start_date": start_date, "end_date": end_date}
+        end_excl = _end_exclusive(end_date)
+        result["date_filter"] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "end_exclusive": end_excl,
+        }
         conds = ["1=1"]
         if start_date:
             conds.append(f"complaint_date >= '{start_date}'")
-        if end_date:
-            conds.append(f"complaint_date < '{end_date}'")
+        if end_excl:
+            conds.append(f"complaint_date < '{end_excl}'")
         if customer_code:
             safe = str(customer_code).replace("'", "''")
             conds.append(f"customer_code LIKE '%{safe}%'")
@@ -4613,17 +6192,22 @@ class PCBQualitySystem:
             if part_number:
                 safe_pn = str(part_number).replace("'", "''")
                 part_filter = f" AND v.MfgPartCode LIKE '%{safe_pn}%'"
-            end_cond = f" AND v.CreateDate < '{end_date}'" if end_date else ""
+            end_cond = f" AND v.CreateDate < '{end_excl}'" if end_excl else ""
+            # 全量按料号聚合：截图/榜单只展示前 30，但 KPI 与成本必须覆盖全部料号，
+            # 不能用 TOP30 之和冒充本期报废总量（会系统性少计）。
+            scrap_date_conds = []
+            if start_date:
+                scrap_date_conds.append(f"AND v.CreateDate >= '{start_date}'")
+            if end_cond:
+                scrap_date_conds.append(end_cond)
             r_parts = self.erp.execute(f"""
                 SELECT v.MfgPartCode AS pn, SUM(v.QtyOfUnit) AS scrap
                 FROM View_P_Inspection v
                 WHERE {self._scrap_non_production_sql()}
-                  AND v.CreateDate >= '{start_date}'
-                  {end_cond}
+                  {' '.join(scrap_date_conds)}
                   {part_filter}
                 GROUP BY v.MfgPartCode
                 ORDER BY SUM(v.QtyOfUnit) DESC
-                LIMIT 30
             """)
             # 1) 物料主数据采购价
             price_map = {}
@@ -4657,44 +6241,59 @@ class PCBQualitySystem:
             scrap_pcs = 0
             priced_pcs = 0
             unpriced_pcs = 0
+            unpriced_parts = 0
+            detail_cap = 30
+            total_parts = 0
             for row in (r_parts.get("data") or []):
                 pn = str(row.get("pn") or "").strip()
                 pcs = int(float(row.get("scrap") or 0))
+                total_parts += 1
                 scrap_pcs += pcs
                 price = price_map.get(pn)
                 src = price_src.get(pn)
                 # 仅允许精确料号匹配；禁止用无关物料均价冒充成品成本
                 if price is None:
                     unpriced_pcs += pcs
-                    result["scrap_cost_by_part"].append({
-                        "part_number": pn,
-                        "scrap_pcs": pcs,
-                        "unit_price": None,
-                        "cost_est": None,
-                        "priced": False,
-                        "price_source": None,
-                    })
+                    unpriced_parts += 1
+                    if len(result["scrap_cost_by_part"]) < detail_cap:
+                        result["scrap_cost_by_part"].append({
+                            "part_number": pn,
+                            "scrap_pcs": pcs,
+                            "unit_price": None,
+                            "cost_est": None,
+                            "priced": False,
+                            "price_source": None,
+                        })
                     continue
                 amt = round(pcs * price, 2)
                 scrap_cost += amt
                 priced_pcs += pcs
-                result["scrap_cost_by_part"].append({
-                    "part_number": pn,
-                    "scrap_pcs": pcs,
-                    "unit_price": price,
-                    "cost_est": amt,
-                    "priced": True,
-                    "price_source": src,
-                })
+                if len(result["scrap_cost_by_part"]) < detail_cap:
+                    result["scrap_cost_by_part"].append({
+                        "part_number": pn,
+                        "scrap_pcs": pcs,
+                        "unit_price": price,
+                        "cost_est": amt,
+                        "priced": True,
+                        "price_source": src,
+                    })
+            result["scrap_cost_by_part_total_parts"] = total_parts
+            result["scrap_cost_by_part_truncated"] = total_parts > len(result["scrap_cost_by_part"])
 
             total_scrap = scrap_pcs or int(scrap.get("total_scrap_pcs") or 0)
             result["kpi"]["scrap_pcs"] = total_scrap
             result["kpi"]["scrap_cost_est"] = round(scrap_cost, 2)
             result["kpi"]["scrap_priced_pcs"] = priced_pcs
             result["kpi"]["scrap_unpriced_pcs"] = unpriced_pcs
+            result["kpi"]["scrap_unpriced_parts"] = unpriced_parts
             result["kpi"]["scrap_price_coverage"] = (
                 round(priced_pcs * 100.0 / scrap_pcs, 1) if scrap_pcs > 0 else None
             )
+            result["price_policy"] = (
+                "单价仅取 materials.material_code / customer_complaints.product_code "
+                "精确匹配；匹配不到的料号不计价、不估算，避免用无关物料均价冒充"
+            )
+            result["data_source"] = "ERP:customer_complaints + materials + View_P_Inspection"
             result["kpi"]["quality_cost_total"] = round(
                 float(result["kpi"]["copq_total"]) + scrap_cost, 2
             )
@@ -4738,21 +6337,68 @@ class PCBQualitySystem:
                        ucl, cl, lcl, cp, cpk, status, updated_at
                 FROM spc_charts
                 WHERE {where}
-                ORDER BY CASE WHEN LOWER(IFNULL(status,''))='alert' THEN 0 ELSE 1 END, id
+                ORDER BY id
             """)
+            rows = r.get("data") or []
+            chart_ids = [int(x["id"]) for x in rows if x.get("id") is not None]
+            meas_map: Dict[int, list] = {}
+            if chart_ids:
+                in_ids = ",".join(str(i) for i in chart_ids)
+                rm_all = self.erp.execute(f"""
+                    SELECT chart_id, measured_at, value, subgroup_index, sample_label
+                    FROM spc_measurements
+                    WHERE chart_id IN ({in_ids})
+                    ORDER BY chart_id, subgroup_index, measured_at
+                """)
+                for mrow in (rm_all.get("data") or []):
+                    try:
+                        cid = int(mrow.get("chart_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    meas_map.setdefault(cid, []).append(mrow)
+
             charts = []
             cpk_vals = []
             alert_n = 0
-            for row in (r.get("data") or []):
-                st = str(row.get("status") or "").lower()
-                if st == "alert":
+            insufficient_n = 0
+            unverified_n = 0
+            stats_by_id: Dict[int, tuple] = {}
+            for row in rows:
+                cid = int(row["id"]) if row.get("id") is not None else None
+                recs = meas_map.get(cid, []) if cid is not None else []
+                subgroup_size = row.get("subgroup_size") or 1
+                calc = None
+                if recs:
+                    calc = _spc_compute(
+                        [x.get("value") for x in recs],
+                        subgroup_size=subgroup_size,
+                        subgroup_ids=[x.get("subgroup_index") for x in recs],
+                        usl=row.get("usl"), lsl=row.get("lsl"),
+                        ucl=row.get("ucl"), cl=row.get("cl"), lcl=row.get("lcl"),
+                    )
+                    stats_by_id[cid] = (calc, recs, subgroup_size)
+                stored_status = str(row.get("status") or "").strip().lower() or None
+                if calc and calc.get("status"):
+                    eff_status = calc["status"]
+                    status_source = "recomputed_from_measurements"
+                else:
+                    eff_status = stored_status or "normal"
+                    status_source = "stored_no_measurements"
+                    unverified_n += 1
+                if eff_status == "alert":
                     alert_n += 1
-                cpk = row.get("cpk")
-                if cpk is not None:
+                elif eff_status == "insufficient":
+                    insufficient_n += 1
+                eff_cp = calc.get("cp") if calc and calc.get("cp") is not None else row.get("cp")
+                eff_cpk = calc.get("cpk") if calc and calc.get("cpk") is not None else row.get("cpk")
+                if eff_cpk is not None:
                     try:
-                        cpk_vals.append(float(cpk))
-                    except Exception:
+                        cpk_vals.append(float(eff_cpk))
+                    except (TypeError, ValueError):
                         pass
+                eff_ucl = calc.get("ucl") if calc else row.get("ucl")
+                eff_cl = calc.get("cl") if calc else row.get("cl")
+                eff_lcl = calc.get("lcl") if calc else row.get("lcl")
                 charts.append({
                     "id": row.get("id"),
                     "chart_code": row.get("chart_code"),
@@ -4760,25 +6406,47 @@ class PCBQualitySystem:
                     "process_name": row.get("process_name"),
                     "characteristic": row.get("characteristic"),
                     "chart_type": row.get("chart_type"),
-                    "subgroup_size": row.get("subgroup_size"),
+                    "subgroup_size": subgroup_size,
                     "unit": row.get("unit") or "",
                     "usl": row.get("usl"),
                     "lsl": row.get("lsl"),
                     "target": row.get("target"),
-                    "ucl": row.get("ucl"),
-                    "cl": row.get("cl"),
-                    "lcl": row.get("lcl"),
-                    "cp": row.get("cp"),
-                    "cpk": row.get("cpk"),
-                    "status": row.get("status") or "normal",
+                    "ucl": round(eff_ucl, 4) if eff_ucl is not None else None,
+                    "cl": round(eff_cl, 4) if eff_cl is not None else None,
+                    "lcl": round(eff_lcl, 4) if eff_lcl is not None else None,
+                    "cp": round(float(eff_cp), 3) if eff_cp is not None else None,
+                    "cpk": round(float(eff_cpk), 3) if eff_cpk is not None else None,
+                    "status": eff_status,
+                    "status_stored": stored_status,
+                    "status_source": status_source,
+                    "status_consistent": (
+                        None if (stored_status is None or not calc)
+                        else (stored_status == eff_status)
+                    ),
+                    "cp_stored": row.get("cp"),
+                    "cpk_stored": row.get("cpk"),
+                    "sample_count": (calc or {}).get("sample_count", 0),
+                    "measurement_count": (calc or {}).get("measurement_count", 0),
+                    "out_of_control_count": (calc or {}).get("out_of_control", 0),
+                    "out_of_spec_count": (calc or {}).get("out_of_spec", 0),
+                    "limits_source": (calc or {}).get("limits_source") or "stored",
                     "updated_at": row.get("updated_at"),
                 })
+            # 告警优先，其次样本不足，最后按 id
+            charts.sort(key=lambda c: (
+                0 if c.get("status") == "alert" else 1,
+                0 if c.get("status") == "insufficient" else 1,
+                c.get("id") or 0,
+            ))
             result["charts"] = charts
             result["summary"] = {
                 "total": len(charts),
                 "alert": alert_n,
-                "normal": len(charts) - alert_n,
+                "normal": sum(1 for c in charts if c.get("status") == "normal"),
+                "insufficient": insufficient_n,
+                "unverified": unverified_n,
                 "avg_cpk": round(sum(cpk_vals) / len(cpk_vals), 3) if cpk_vals else None,
+                "status_source": "recomputed_from_measurements",
             }
             result["has_data"] = len(charts) > 0
 
@@ -4794,51 +6462,154 @@ class PCBQualitySystem:
                 detail_id = (alert_one or charts[0]).get("id")
 
             if detail_id:
-                rd = self.erp.execute(f"""
-                    SELECT * FROM spc_charts WHERE id = {int(detail_id)}
-                """)
-                if rd.get("success") and rd.get("data"):
-                    d = rd["data"][0]
-                    points = []
-                    raw_dp = d.get("data_points") or "[]"
-                    try:
-                        points = json.loads(raw_dp) if isinstance(raw_dp, str) else (raw_dp or [])
-                    except Exception:
-                        points = []
-                    measurements = []
-                    rm = self.erp.execute(f"""
-                        SELECT measured_at, value, subgroup_index, sample_label
-                        FROM spc_measurements
-                        WHERE chart_id = {int(detail_id)}
-                        ORDER BY subgroup_index, measured_at
-                    """)
-                    for row in (rm.get("data") or []):
-                        measurements.append({
-                            "measured_at": row.get("measured_at"),
-                            "value": row.get("value"),
-                            "subgroup_index": row.get("subgroup_index"),
-                            "sample_label": row.get("sample_label"),
-                        })
-                    ooc = [p for p in points if p.get("out_of_control")]
-                    result["detail"] = {
-                        "id": d.get("id"),
-                        "chart_code": d.get("chart_code"),
-                        "chart_name": d.get("chart_name"),
-                        "process_name": d.get("process_name"),
-                        "characteristic": d.get("characteristic"),
-                        "chart_type": d.get("chart_type"),
-                        "subgroup_size": d.get("subgroup_size"),
-                        "unit": d.get("unit") or "",
-                        "usl": d.get("usl"), "lsl": d.get("lsl"), "target": d.get("target"),
-                        "ucl": d.get("ucl"), "cl": d.get("cl"), "lcl": d.get("lcl"),
-                        "cp": d.get("cp"), "cpk": d.get("cpk"),
-                        "status": d.get("status") or "normal",
-                        "updated_at": d.get("updated_at"),
-                        "data_points": points,
-                        "measurements": measurements,
-                        "out_of_control_count": len(ooc),
-                        "out_of_control_points": ooc,
-                    }
+                try:
+                    did = int(detail_id)
+                except (TypeError, ValueError):
+                    did = None
+                if did is not None:
+                    rd = self.erp.execute(f"SELECT * FROM spc_charts WHERE id = {did}")
+                    if rd.get("success") and rd.get("data"):
+                        d = rd["data"][0]
+                        recs = meas_map.get(did)
+                        if recs is None:
+                            rm = self.erp.execute(f"""
+                                SELECT chart_id, measured_at, value, subgroup_index, sample_label
+                                FROM spc_measurements
+                                WHERE chart_id = {did}
+                                ORDER BY subgroup_index, measured_at
+                            """)
+                            recs = rm.get("data") or []
+                        sub_size = int(d.get("subgroup_size") or 1)
+                        calc = None
+                        if recs:
+                            calc = _spc_compute(
+                                [x.get("value") for x in recs],
+                                subgroup_size=sub_size,
+                                subgroup_ids=[x.get("subgroup_index") for x in recs],
+                                usl=d.get("usl"), lsl=d.get("lsl"),
+                                ucl=d.get("ucl"), cl=d.get("cl"), lcl=d.get("lcl"),
+                            )
+                        measurements = [{
+                            "measured_at": x.get("measured_at"),
+                            "value": x.get("value"),
+                            "subgroup_index": x.get("subgroup_index"),
+                            "sample_label": x.get("sample_label"),
+                        } for x in recs]
+
+                        raw_dp = d.get("data_points") or "[]"
+                        try:
+                            stored_points = json.loads(raw_dp) if isinstance(raw_dp, str) else (raw_dp or [])
+                        except Exception:
+                            stored_points = []
+
+                        if calc:
+                            # 用 spc_measurements 重建绘图点：Xbar 图为子组均值，I-MR 为单值
+                            points = []
+                            if sub_size > 1:
+                                groups: Dict[Any, list] = {}
+                                order: list[Any] = []
+                                missing_ids = all(x.get("subgroup_index") is None for x in recs)
+                                if missing_ids:
+                                    for i in range(0, len(recs), sub_size):
+                                        key = ("s", i // sub_size)
+                                        groups[key] = recs[i:i + sub_size]
+                                        order.append(key)
+                                else:
+                                    for x in recs:
+                                        key = x.get("subgroup_index")
+                                        if key not in groups:
+                                            groups[key] = []
+                                            order.append(key)
+                                        groups[key].append(x)
+                                for k, key in enumerate(order, 1):
+                                    grp = groups[key]
+                                    gvals = [float(x["value"]) for x in grp if x.get("value") is not None]
+                                    if not gvals:
+                                        continue
+                                    gmean = sum(gvals) / len(gvals)
+                                    grng = (max(gvals) - min(gvals)) if len(gvals) > 1 else None
+                                    points.append({
+                                        "index": k,
+                                        "value": round(gmean, 4),
+                                        "range": round(grng, 4) if grng is not None else None,
+                                        "subgroup_index": None if isinstance(key, tuple) else key,
+                                        "sample_label": grp[0].get("sample_label"),
+                                        "measured_at": grp[-1].get("measured_at"),
+                                    })
+                            else:
+                                for k, x in enumerate(recs, 1):
+                                    points.append({
+                                        "index": k,
+                                        "value": x.get("value"),
+                                        "subgroup_index": x.get("subgroup_index"),
+                                        "sample_label": x.get("sample_label"),
+                                        "measured_at": x.get("measured_at"),
+                                    })
+                            for p in points:
+                                try:
+                                    pv = float(p["value"])
+                                except (TypeError, ValueError):
+                                    p["out_of_control"] = False
+                                    p["out_of_spec"] = False
+                                    continue
+                                p["out_of_control"] = bool(
+                                    (calc["ucl"] is not None and pv > calc["ucl"])
+                                    or (calc["lcl"] is not None and pv < calc["lcl"])
+                                )
+                                p["out_of_spec"] = bool(
+                                    (d.get("usl") is not None and pv > float(d["usl"]))
+                                    or (d.get("lsl") is not None and pv < float(d["lsl"]))
+                                )
+                            ooc = [p for p in points if p.get("out_of_control")]
+                            data_points_source = "spc_measurements"
+                        else:
+                            points = stored_points
+                            ooc = [p for p in points if p.get("out_of_control")]
+                            data_points_source = "stored_json_no_measurements"
+
+                        eff_status = (
+                            calc["status"] if calc and calc.get("status")
+                            else (d.get("status") or "normal")
+                        )
+                        eff_cp = calc["cp"] if calc and calc.get("cp") is not None else d.get("cp")
+                        eff_cpk = calc["cpk"] if calc and calc.get("cpk") is not None else d.get("cpk")
+                        eff_ucl = calc["ucl"] if calc else d.get("ucl")
+                        eff_cl = calc["cl"] if calc else d.get("cl")
+                        eff_lcl = calc["lcl"] if calc else d.get("lcl")
+                        result["detail"] = {
+                            "id": d.get("id"),
+                            "chart_code": d.get("chart_code"),
+                            "chart_name": d.get("chart_name"),
+                            "process_name": d.get("process_name"),
+                            "characteristic": d.get("characteristic"),
+                            "chart_type": d.get("chart_type"),
+                            "subgroup_size": sub_size,
+                            "unit": d.get("unit") or "",
+                            "usl": d.get("usl"), "lsl": d.get("lsl"), "target": d.get("target"),
+                            "ucl": round(eff_ucl, 4) if eff_ucl is not None else None,
+                            "cl": round(eff_cl, 4) if eff_cl is not None else None,
+                            "lcl": round(eff_lcl, 4) if eff_lcl is not None else None,
+                            "cp": round(float(eff_cp), 3) if eff_cp is not None else None,
+                            "cpk": round(float(eff_cpk), 3) if eff_cpk is not None else None,
+                            "cp_stored": d.get("cp"), "cpk_stored": d.get("cpk"),
+                            "status": eff_status,
+                            "status_stored": d.get("status"),
+                            "status_source": (
+                                "recomputed_from_measurements" if calc
+                                else "stored_no_measurements"
+                            ),
+                            "limits_source": (calc or {}).get("limits_source") or "stored",
+                            "updated_at": d.get("updated_at"),
+                            "data_points": points,
+                            "data_points_source": data_points_source,
+                            "stored_point_count": len(stored_points),
+                            "measurements": measurements,
+                            "sample_count": (calc or {}).get("sample_count", len(points)),
+                            "measurement_count": len(recs),
+                            "out_of_control_count": len(ooc),
+                            "out_of_control_points": ooc,
+                            "out_of_spec_count": (calc or {}).get("out_of_spec", 0),
+                        }
             return result
         except Exception as e:
             logger.warning("SPC 分析失败: %s", e)
@@ -4860,8 +6631,10 @@ class PCBQualitySystem:
             "kpi": {
                 "inspect_count": 0, "pass_count": 0, "ng_count": 0,
                 "pass_rate": None, "ng_rate": None, "pending_count": 0,
+                "pending_count_scope": "当前全量待审（按工序筛选，不受近N日窗口限制）",
             },
             "process_rates": [],
+            "by_inspect_type": [],
             "daily_trend": [],
             "customer_ng_top": [],
             "backlog": {
@@ -4883,9 +6656,18 @@ class PCBQualitySystem:
 
         try:
             proc_filter = ""
+            q_proc_filter = ""
+            q_proc_filter_alias = ""
             if process_name:
-                safe = str(process_name).replace("'", "''")
-                proc_filter = f" AND IFNULL(p.CPROCESS_NAME,'待确认工序') LIKE '%{safe}%'"
+                aliases = aliases_including_self(str(process_name).strip())
+                in_list = "', '".join(a.replace("'", "''") for a in aliases)
+                proc_filter = (
+                    f" AND IFNULL(p.CPROCESS_NAME,'待确认工序') IN ('{in_list}')"
+                )
+                # quality_inspection_records 同口径工序过滤（未取别名的查询/取别名 q 的查询各一份）
+                q_proc_filter = f" AND IFNULL(process_name,'') IN ('{in_list}')"
+                q_proc_filter_alias = f" AND IFNULL(q.process_name,'') IN ('{in_list}')"
+                result["process_filter"] = {"applied": list(aliases)}
 
             # KPI：近 N 日检验单
             r = db.execute(f"""
@@ -4910,14 +6692,58 @@ class PCBQualitySystem:
                     result["kpi"]["ng_rate"] = round(ng_c * 100.0 / total, 2)
                     result["has_data"] = True
 
-            # 待审积压（全量未审，领导更关心当前积压而非窗口截断）
-            r_pend = db.execute("""
-                SELECT COUNT(*) AS pending FROM quality_inspection_records WHERE status='pending'
+            # 检验类型拆分（MES CINSPECT_TYPE）：桥接库无类型名称字典，按原始编码展示，避免臆造名称
+            r_type = db.execute(f"""
+                SELECT r.CINSPECT_TYPE AS inspect_type,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN r.CRESULT=1 THEN 1 ELSE 0 END) AS pass_c,
+                       SUM(CASE WHEN r.CRESULT=2 THEN 1 ELSE 0 END) AS ng_c
+                FROM TBL_QM_INSPECT_RECORD r
+                LEFT JOIN TBL_BD_PROCESS p ON r.CPROCESS_ID = p.CID
+                WHERE r.CCREATE_DATE >= date('now', '-{n} days')
+                  {proc_filter}
+                GROUP BY r.CINSPECT_TYPE
+                ORDER BY COUNT(*) DESC
+            """)
+            for row in (r_type.get("data") or []):
+                t = int(row.get("total") or 0)
+                if t <= 0:
+                    continue
+                code = row.get("inspect_type")
+                pc = int(row.get("pass_c") or 0)
+                nc = int(row.get("ng_c") or 0)
+                result["by_inspect_type"].append({
+                    "inspect_type": code,
+                    "label": f"类型{code}" if code is not None else "未分类",
+                    "total": t,
+                    "pass_count": pc,
+                    "ng_count": nc,
+                    "pass_rate": round(pc * 100.0 / t, 2),
+                    "ng_rate": round(nc * 100.0 / t, 2),
+                })
+            result["inspect_type_note"] = (
+                "检验类型名称在桥接库中未定义，按 MES 原始 CINSPECT_TYPE 编码展示（类型N）"
+            )
+
+            # 待审积压（当前全量未审，领导更关心当前积压；按工序筛选但不受近N日窗口限制）
+            r_pend = db.execute(f"""
+                SELECT COUNT(*) AS pending FROM quality_inspection_records
+                WHERE status='pending' {q_proc_filter}
             """)
             pending = 0
             if r_pend.get("success") and r_pend.get("data"):
                 pending = int(r_pend["data"][0].get("pending") or 0)
             result["kpi"]["pending_count"] = pending
+            # 同口径（近N日窗口 + 工序）待审计数，便于与 KPI 检验量对照
+            r_pend_win = db.execute(f"""
+                SELECT COUNT(*) AS pending FROM quality_inspection_records
+                WHERE status='pending'
+                  AND IFNULL(inspected_at, created_at) >= date('now', '-{n} days')
+                  {q_proc_filter}
+            """)
+            pending_in_window = 0
+            if r_pend_win.get("success") and r_pend_win.get("data"):
+                pending_in_window = int(r_pend_win["data"][0].get("pending") or 0)
 
             # 工序合格率
             r = db.execute(f"""
@@ -4932,10 +6758,24 @@ class PCBQualitySystem:
                 GROUP BY IFNULL(p.CPROCESS_NAME, '待确认工序')
                 ORDER BY COUNT(*) DESC
             """)
+            raw_rates = []
             for row in (r.get("data") or []):
                 t = int(row.get("total") or 0) or 1
                 pc = int(row.get("pass_c") or 0)
                 nc = int(row.get("ng_c") or 0)
+                raw_rates.append({
+                    "process_name": normalize_process_name(row.get("process_name")) or "待确认工序",
+                    "total": t,
+                    "pass_count": pc,
+                    "ng_count": nc,
+                })
+            for row in merge_counts_by_process(
+                raw_rates, name_key="process_name",
+                sum_keys=["total", "pass_count", "ng_count"],
+            ):
+                t = int(row.get("total") or 0) or 1
+                pc = int(row.get("pass_count") or 0)
+                nc = int(row.get("ng_count") or 0)
                 result["process_rates"].append({
                     "process_name": row.get("process_name") or "待确认工序",
                     "total": t,
@@ -4943,7 +6783,12 @@ class PCBQualitySystem:
                     "ng_count": nc,
                     "pass_rate": round(pc * 100.0 / t, 2),
                     "ng_rate": round(nc * 100.0 / t, 2),
+                    "data_source": "MES:TBL_QM_INSPECT_RECORD",
                 })
+            # 仅展示 MES 检验实据工序；禁止 quality_metrics 造数补洞
+
+            result["process_rates"].sort(key=lambda x: process_sort_key(x.get("process_name")))
+            result["process_catalog"] = list(STANDARD_PROCESSES)
 
             # 日不合格率趋势
             r = db.execute(f"""
@@ -4979,6 +6824,7 @@ class PCBQualitySystem:
                 LEFT JOIN customers c ON c.customer_code = q.customer_code
                 WHERE q.customer_code IS NOT NULL AND q.customer_code <> ''
                   AND IFNULL(q.inspected_at, q.created_at) >= date('now', '-{n} days')
+                  {q_proc_filter_alias}
                 GROUP BY q.customer_code
                 HAVING ng_c > 0
                 ORDER BY ng_c DESC
@@ -4995,6 +6841,7 @@ class PCBQualitySystem:
                     LEFT JOIN customers c ON c.customer_code = q.customer_code
                     WHERE q.customer_code IS NOT NULL AND q.customer_code <> ''
                       AND IFNULL(q.inspected_at, q.created_at) >= date('now', '-{n} days')
+                      {q_proc_filter_alias}
                     GROUP BY q.customer_code
                     HAVING ng_c > 0
                     ORDER BY ng_c DESC
@@ -5014,11 +6861,12 @@ class PCBQualitySystem:
             # ① 待审龄期（与柱图同口径）：只用 source_created_at，避免旧种子 created_at 把龄期拉爆
             # ② 已审时效：创建→修改；若绝大多数时差≈0（同步特征），标记不可靠，避免与待审图打架
             notes = []
-            r_cnt = db.execute("""
+            r_cnt = db.execute(f"""
                 SELECT
                   SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
                   SUM(CASE WHEN status IN ('passed','failed') THEN 1 ELSE 0 END) AS audited
                 FROM quality_inspection_records
+                WHERE 1=1 {q_proc_filter}
             """)
             audited = 0
             if r_cnt.get("success") and r_cnt.get("data"):
@@ -5026,7 +6874,7 @@ class PCBQualitySystem:
                 pending = int(r_cnt["data"][0].get("pending") or pending or 0)
                 result["kpi"]["pending_count"] = pending
 
-            r_age = db.execute("""
+            r_age = db.execute(f"""
                 SELECT
                   COUNT(*) AS aged_n,
                   ROUND(AVG(age_h), 1) AS avg_age,
@@ -5039,6 +6887,7 @@ class PCBQualitySystem:
                   SELECT (julianday('now') - julianday(source_created_at)) * 24 AS age_h
                   FROM quality_inspection_records
                   WHERE status = 'pending' AND source_created_at IS NOT NULL
+                    {q_proc_filter}
                 )
             """)
             buckets = [
@@ -5068,7 +6917,7 @@ class PCBQualitySystem:
             if skip_pending:
                 notes.append(f"{skip_pending} 条待审缺少 source_created_at，未计入龄期分层")
 
-            r_audit = db.execute("""
+            r_audit = db.execute(f"""
                 SELECT
                   COUNT(*) AS total,
                   SUM(CASE WHEN (julianday(source_modified_at)-julianday(source_created_at))*24*60 >= 1
@@ -5078,6 +6927,8 @@ class PCBQualitySystem:
                 FROM quality_inspection_records
                 WHERE status IN ('passed','failed')
                   AND source_created_at IS NOT NULL AND source_modified_at IS NOT NULL
+                  AND source_created_at >= date('now', '-{n} days')
+                  {q_proc_filter}
             """)
             avg_h = None
             audit_reliable = False
@@ -5096,8 +6947,15 @@ class PCBQualitySystem:
                         "本图以待审龄期为准"
                     )
 
+            # 口径说明：待审/龄期为当前全量（按工序筛选），已审时效按近 N 日创建口径
+            notes.append(
+                "待审积压、龄期为当前全量（按工序筛选），不受近N日窗口限制；"
+                f"已审时效按近{n}日创建口径"
+            )
             result["backlog"] = {
                 "pending": pending,
+                "pending_in_window": pending_in_window,
+                "pending_scope": "当前全量待审（按工序筛选，不受近N日窗口限制）",
                 "audited": audited,
                 "pending_with_age": aged_n,
                 "pending_avg_age_hours": pending_avg_age,
@@ -5148,34 +7006,42 @@ class PCBQualitySystem:
             return result
 
     def scan_quality_alerts(self, fiscal_period=None):
-        """从 ERP/MES 扫描当月品质数据并生成/刷新预警（禁止编造，仅实数）"""
+        """从 ERP/MES 扫描当月品质数据并生成/刷新预警（禁止编造，仅实数）
+
+        预警使用稳定指纹：同周期同问题只保留一条，刷新指标与 last_seen_at；
+        本期未再触发的自动预警归档（不删除），已确认记录全程保留。
+        """
         if not fiscal_period:
             fiscal_period = datetime.now().strftime("%Y%m")
 
-        # 先清：非当月旧预警 + 低样本/0%跳变等不可靠记录
-        purged_stale = self.db.purge_stale_alerts(fiscal_period)
+        # 归档旧版按天 id 的预警（保留审计历史）；清理已证伪的低样本/跳变记录
+        archived_legacy = self.db.purge_stale_alerts(fiscal_period)
         purged_bad = self.db.purge_unreliable_alerts()
-        purged = list(dict.fromkeys(purged_stale + purged_bad))
+        merged_patterns = self.db.merge_duplicate_patterns()
 
         created = []
+        scopes = {"全厂"}
         sources = {
             "plant_scrap": False, "plant_mes": False, "top_parts": 0,
-            "purged": len(purged), "purged_stale": len(purged_stale),
+            "purged": len(purged_bad), "archived_legacy": len(archived_legacy),
+            "merged_patterns": merged_patterns,
         }
 
         # 1) 全厂报废 + 日趋势（ERP）
         scrap = self.get_scrap_analysis(None, fiscal_period=fiscal_period)
         sources["plant_scrap"] = True
+        # rate=None 表示无入库基数，generate_alerts 内部会跳过报废率预警
         created.extend(self.engine.generate_alerts(
-            float(scrap.get("scrap_rate") or 0),
+            scrap.get("scrap_rate"),
             "全厂",
             [],
             scrap.get("monthly_trend") or [],
             scrap_pcs=float(scrap.get("total_scrap_pcs") or 0),
+            fiscal_period=fiscal_period,
         ))
 
-        # 2) 全厂 MES 工序良率（按工单关联有数时）
-        proc = self.get_process_yield(None)
+        # 2) 全厂 MES 工序良率（限定当月工单，避免用全历史稀释/放大）
+        proc = self.get_process_yield(None, fiscal_period=fiscal_period)
         sources["plant_mes"] = bool(proc.get("process_yield"))
         created.extend(self.engine.generate_alerts(
             0,
@@ -5183,33 +7049,45 @@ class PCBQualitySystem:
             proc.get("process_yield") or [],
             [],
             scrap_pcs=0,
+            fiscal_period=fiscal_period,
         ))
 
         # 3) TOP 报废料号逐一扫描（ERP 报废率 + 该料号 MES）
+        #    仅当排行榜是真实料号口径时才按料号扫描；low_yield 模式下列表是工序名，
+        #    若当料号用会造出「以工序名为料号」的伪预警。
         dash = self.get_dashboard(fiscal_period)
-        top_parts = dash.get("top_defect_parts") or []
+        top_parts = (
+            (dash.get("top_defect_parts") or [])
+            if dash.get("ranking_mode") == "scrap_parts"
+            else []
+        )
         for row in top_parts[:8]:
             part = (row.get("PartNumber") or row.get("part") or "").strip()
             if not part:
                 continue
-            rate = float(row.get("RejectRate") or 0)
+            scopes.add(part)
+            # RejectRate=None 表示该料号无入库基数；不生成 100% 伪预警
+            rate = row.get("RejectRate")
             reject = float(row.get("TotalReject") or row.get("scrap_pcs") or 0)
             # 料号报废预警
             created.extend(self.engine.generate_alerts(
-                rate, part, [], [], scrap_pcs=reject,
+                rate, part, [], [], scrap_pcs=reject, fiscal_period=fiscal_period,
             ))
-            # 料号 MES 工序
-            p_mes = self.get_process_yield(part)
+            # 料号 MES 工序（同周期）
+            p_mes = self.get_process_yield(part, fiscal_period=fiscal_period)
             if p_mes.get("process_yield"):
                 created.extend(self.engine.generate_alerts(
                     0, part, p_mes.get("process_yield") or [], [], scrap_pcs=0,
+                    fiscal_period=fiscal_period,
                 ))
             sources["top_parts"] += 1
 
-        # 去重（同 id 可能被多次 generate）
+        # 去重（同 id 可能被多次 generate，后写覆盖先写）
         uniq = {}
         for a in created:
             uniq[a["id"]] = a
+        # 本期已扫描范围内、本次未再触发的自动预警 → 归档（问题不再成立）
+        resolved = self.db.resolve_missing_alerts(fiscal_period, list(uniq), scopes)
         active = self.db.get_alerts(acknowledged=False, limit=200)
         critical = [a for a in active if a.get("level") == "critical"]
         return {
@@ -5217,7 +7095,9 @@ class PCBQualitySystem:
             "fiscal_period": fiscal_period,
             "sources": sources,
             "generated": len(uniq),
-            "purged": len(purged),
+            "purged": len(purged_bad),
+            "archived_legacy": len(archived_legacy),
+            "resolved": len(resolved),
             "active_alerts": len(active),
             "critical_alerts": len(critical),
             "alerts": list(uniq.values())[:30],
@@ -5226,7 +7106,7 @@ class PCBQualitySystem:
             "policy": "指标仅来自 ERP/MES 实查，禁止编造；建议文案可为知识库模板",
         }
 
-    def generate_8d_report(self, part_number, start_date=None, end_date=None, period=None, fiscal_period=None):
+    def generate_8d_report(self, part_number, start_date=None, end_date=None, period=None, fiscal_period=None, alert_id=None):
         """生成真实有效的 8D：ERP/MES 实据 + 已关闭历史方案 / 已验证知识"""
         part_number = (part_number or "").strip()
         if not part_number:
@@ -5237,8 +7117,10 @@ class PCBQualitySystem:
         if fiscal_period:
             pass
         elif period:
-            year, month = period.split("-")
-            fiscal_period = f"{year}{month}"
+            parts = _period_parts(period)
+            if not parts:
+                return {"success": False, "error": f"周期格式无效：{period}"}
+            fiscal_period = parts[0]
         elif not start_date and not end_date:
             fiscal_period = datetime.now().strftime("%Y%m")
 
@@ -5246,7 +7128,11 @@ class PCBQualitySystem:
         purged = self.db.purge_invalid_8d()
 
         scrap = self.get_scrap_analysis(part_number, start_date, end_date, fiscal_period=fiscal_period)
-        process = self.get_process_yield(part_number, fiscal_period=fiscal_period)
+        process = self.get_process_yield(
+            part_number, fiscal_period=fiscal_period,
+            start_date=start_date if not fiscal_period else None,
+            end_date=end_date if not fiscal_period else None,
+        )
         wo = self.get_work_orders(part_number, start_date, end_date, fiscal_period=fiscal_period)
 
         scrap_pcs = int(scrap.get("total_scrap_pcs") or 0)
@@ -5267,8 +7153,10 @@ class PCBQualitySystem:
         evidence = {
             "part_number": part_number,
             "fiscal_period": fiscal_period or scrap.get("fiscal_period") or "",
+            "source_alert_id": str(alert_id or ""),
             "date_range": f"{start_date or ''} ~ {end_date or ''}".strip(" ~"),
-            "scrap_rate": float(scrap.get("scrap_rate") or 0),
+            "scrap_rate": scrap.get("scrap_rate"),
+            "rate_reliable": bool(scrap.get("rate_reliable")),
             "scrap_pcs": scrap_pcs,
             "stock_pcs": stock_pcs,
             "input_base_pcs": int(scrap.get("input_base_pcs") or (scrap_pcs + stock_pcs)),
@@ -5316,6 +7204,8 @@ class PCBQualitySystem:
                       "knowledge_refs_json", "data_policy",
                       "status", "severity", "created_by", "created_at",
                   )}
+        db_row["alert_id"] = str(alert_id or "")
+        db_row["fiscal_period"] = str(evidence.get("fiscal_period") or "")
         self.db.save_8d(db_row)
         content["success"] = True
         content["purged_invalid"] = purged
@@ -5462,7 +7352,9 @@ def flatten_external_8d_report(
         or problem_desc
     )
     status_raw = (meta.get("status") or "进行中").strip()
-    status = "closed" if status_raw in ("已关闭", "closed") else "open"
+    # 外部/生成 8D 一律以 open 入库：关闭必须经人工编辑 + validate_8d_closure 校验，
+    # 否则自动生成稿会混入「已关闭历史方案」污染 D4/D5 知识溯源。
+    status = "open"
 
     phenomenon = (
         str(d2.get("phenomenon") or "").strip()
@@ -5561,6 +7453,8 @@ def flatten_external_8d_report(
         "history_refs_json": "[]",
         "knowledge_refs_json": json.dumps(knowledge_pack, ensure_ascii=False),
         "data_policy": "external=langgraph;/api/v1/8d/generate;review_required=1",
+        "alert_id": str(extra.get("alert_id") or ""),
+        "fiscal_period": str(extra.get("fiscal_period") or ""),
         "status": status,
         "severity": 3,
         "created_by": "LangGraph-8D",
@@ -5628,6 +7522,566 @@ def call_external_8d_generate(payload: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════
+# 8D D4/D5 可追溯闸门
+# 只允许 GraphRAG / 已关闭·已验证 8D 中的条目进入报告；
+# 匹配不到的根因/对策一律改写为“待现场确认/待制定”，不落库为事实。
+# ═══════════════════════════════════════════════════
+
+_D4_PENDING = "待现场确认：GraphRAG 与历史已验证 8D 未检索到可引用根因（禁止以推测代替）"
+_D5_PENDING = "待制定：GraphRAG 与历史已验证 8D 未命中可用对策，须现场确认根因后制定并通过 D6 验证"
+
+_GROUND_PUNCT = re.compile(
+    r"[\s\u3000·,，。;；:：、/\\|()（）\[\]【】<>《》\"'“”‘’\-—_+%=~`!?！？*#>]+"
+)
+_GROUND_TAG = re.compile(r"^[\[【][^\]】]{1,16}[\]】]\s*")
+_GROUND_SKIP_LINE = re.compile(
+    r"^(\d+[.、)]\s*)?(Why\d*|料号|周期|报废率|缺陷帕累托|工序集中度|MES|优先核查|"
+    r"数据源|说明|建议|不良现象|产品|现象|发现工序|影响数量|关联证据|完成时限|责任人)[：:]",
+    re.IGNORECASE,
+)
+
+
+def _ground_norm(text: str) -> str:
+    text = _GROUND_TAG.sub("", str(text or ""))
+    return _GROUND_PUNCT.sub("", text).lower()
+
+
+def _ground_bigrams(norm: str) -> set:
+    if len(norm) < 2:
+        return {norm} if norm else set()
+    return {norm[i:i + 2] for i in range(len(norm) - 1)}
+
+
+def _ground_split_lines(text: str) -> List[str]:
+    """把历史 8D 的 D4/D5 拆成可逐条比对的候选句，跳过标题、纯实据行与待办占位。"""
+    out = []
+    for raw in str(text or "").splitlines():
+        line = re.sub(r"^[-•·*\d.、)\s→]+", "", raw.strip()).strip()
+        if not line or line.startswith("【"):
+            continue
+        if any(mark in line for mark in ("待现场确认", "待确认", "待填写", "未核实", "禁止以推测")):
+            continue
+        if _GROUND_SKIP_LINE.match(line):
+            continue
+        if len(_ground_norm(line)) < 6:
+            continue
+        out.append(line)
+    return out
+
+
+def _ground_lookup(text: str, candidates: List[dict]) -> Optional[dict]:
+    """在允许来源中找最接近的一条；先直接包含，再二元组重合，最后最长公共子串。"""
+    tn = _ground_norm(text)
+    if len(tn) < 4 or not candidates:
+        return None
+    tn_bi = _ground_bigrams(tn)
+    for c in candidates:
+        cn = _ground_norm(c.get("text"))
+        if not cn:
+            continue
+        if tn == cn:
+            return c
+        if len(tn) >= 6 and tn in cn:
+            return c
+        if len(cn) >= 6 and cn in tn:
+            return c
+    best, best_size, best_ratio, best_overlap = None, 0, 0.0, 0.0
+    for c in candidates:
+        cn = _ground_norm(c.get("text"))
+        if not cn:
+            continue
+        cn_bi = _ground_bigrams(cn)
+        overlap = len(tn_bi & cn_bi) / max(1, min(len(tn_bi), len(cn_bi)))
+        if overlap >= 0.6:
+            return c
+        sm = difflib.SequenceMatcher(None, tn, cn)
+        size = sm.find_longest_match(0, len(tn), 0, len(cn)).size
+        if size < 5:
+            continue
+        ratio = size / max(1, min(len(tn), len(cn)))
+        if size > best_size or (size == best_size and ratio > best_ratio):
+            best, best_size, best_ratio, best_overlap = c, size, ratio, overlap
+    if best is not None and (best_size >= 6 or best_ratio >= 0.5 or best_overlap >= 0.5):
+        return best
+    return None
+
+
+def _ground_filter_text(text: str, candidates: List[dict]) -> tuple:
+    """整句命中则保留；否则按句拆分，只保留有出处的分句。"""
+    if not candidates:
+        return "", []
+    hit = _ground_lookup(text, candidates)
+    if hit:
+        return text, [hit]
+    kept, hits = [], []
+    for part in re.split(r"(?<=[。；;！!？?\n])", str(text or "")):
+        part = part.strip(" \t\r\n")
+        if len(_ground_norm(part)) < 5:
+            continue
+        h = _ground_lookup(part, candidates)
+        if h:
+            kept.append(part)
+            hits.append(h)
+    return "".join(kept).strip(), hits
+
+
+def _collect_8d_grounding(part: str, phenomenon: str, process_name: str, db) -> dict:
+    """汇总 D4/D5 允许引用的来源：GraphRAG / 已关闭 8D / 已验证知识。"""
+    causes: List[dict] = []
+    measures: List[dict] = []
+    graphrag_refs: List[dict] = []
+    history_refs: List[dict] = []
+    verified_refs: List[dict] = []
+    seen = set()
+
+    def _add(bucket, text, source, kind):
+        text = str(text or "").strip()
+        if not text:
+            return
+        key = (kind, _ground_norm(text)[:120])
+        if key in seen:
+            return
+        seen.add(key)
+        bucket.append({"text": text, "source": source, "kind": kind})
+
+    if phenomenon or process_name:
+        try:
+            pack = get_graphrag_client().lookup_for_8d(
+                defect_names=[phenomenon] if phenomenon else [],
+                process_names=[process_name] if process_name else [],
+            )
+            graphrag_refs = [r for r in (pack.get("refs") or []) if r.get("matched")]
+            for ref in graphrag_refs:
+                gname = str(ref.get("matched") or ref.get("query") or "").strip()
+                src = f"GraphRAG:{gname}" if gname else "GraphRAG"
+                for rc in ref.get("root_causes") or []:
+                    _add(causes, rc.get("cause"), src, "graphrag")
+                for cm in ref.get("countermeasures") or []:
+                    _add(measures, cm.get("measure"), src, "graphrag")
+        except Exception as e:
+            logger.warning("8D 可追溯闸门检索 GraphRAG 失败: %s", e)
+
+    try:
+        history = db.find_closed_8d_history(
+            part_number=part,
+            defect_types=[phenomenon] if phenomenon else [],
+            process_names=[process_name] if process_name else [],
+            limit=6,
+        )
+    except Exception as e:
+        logger.warning("8D 可追溯闸门读取历史关闭 8D 失败: %s", e)
+        history = []
+    for h in history:
+        ref_no = str(h.get("report_no") or h.get("id") or "").strip()
+        src = f"历史8D:{ref_no}" if ref_no else "历史8D"
+        history_refs.append({
+            "report_no": h.get("report_no"),
+            "part_number": h.get("part_number"),
+            "closed_at": h.get("closed_at"),
+            "match_score": h.get("match_score"),
+        })
+        for line in _ground_split_lines(h.get("d4")):
+            _add(causes, line, src, "closed_8d")
+        for line in _ground_split_lines(h.get("d5")):
+            _add(measures, line, src, "closed_8d")
+
+    if phenomenon:
+        try:
+            patterns = db.get_verified_patterns(defect_type=phenomenon, limit=10)
+        except Exception as e:
+            logger.warning("8D 可追溯闸门读取已验证知识失败: %s", e)
+            patterns = []
+        for vp in patterns:
+            src_no = str(vp.get("source_8d") or "").strip()
+            src = f"已验证:{src_no}" if src_no else "已验证知识"
+            verified_refs.append({
+                "defect_type": vp.get("defect_type"),
+                "process_name": vp.get("process_name"),
+                "source_8d": src_no,
+            })
+            for c in vp.get("root_causes") or []:
+                _add(causes, c, src, "verified")
+            for s in vp.get("solutions") or []:
+                _add(measures, s, src, "verified")
+
+    return {
+        "causes": causes,
+        "measures": measures,
+        "graphrag_refs": graphrag_refs,
+        "history_refs": history_refs,
+        "verified_refs": verified_refs,
+    }
+
+
+def _apply_8d_grounding(report: dict, part: str, problem: str, db) -> tuple:
+    """在落库前过滤外部 8D 的 D4/D5：无出处的内容不保留为根因/对策。"""
+    info = {
+        "policy": "d4_d5=GraphRAG+closed/verified_8D_only",
+        "phenomenon": "",
+        "process_name": "",
+        "d4_kept": 0,
+        "d4_dropped": 0,
+        "d5_kept": 0,
+        "d5_dropped": 0,
+        "d4_sources": [],
+        "d5_sources": [],
+        "graphrag_refs": [],
+        "history_refs": [],
+        "verified_refs": [],
+    }
+    if not isinstance(report, dict):
+        return report, info
+    d4 = report.get("d4_root_cause") if isinstance(report.get("d4_root_cause"), dict) else None
+    d5 = report.get("d5_corrective") if isinstance(report.get("d5_corrective"), dict) else None
+    if d4 is None and d5 is None:
+        return report, info
+
+    d2 = report.get("d2_problem") if isinstance(report.get("d2_problem"), dict) else {}
+    phenomenon = str(d2.get("phenomenon") or "").strip()
+    if not phenomenon and d4:
+        phenomenon = str(d4.get("defect_phenomenon") or "").strip()
+    if not phenomenon:
+        phenomenon = (problem or "").strip()[:60]
+    process_name = str(d2.get("discovery_process") or "").strip()
+    info["phenomenon"] = phenomenon
+    info["process_name"] = process_name
+
+    sources = _collect_8d_grounding(part, phenomenon, process_name, db)
+    info["graphrag_refs"] = sources["graphrag_refs"]
+    info["history_refs"] = sources["history_refs"]
+    info["verified_refs"] = sources["verified_refs"]
+
+    if d4 is not None:
+        chain = d4.get("why_chain")
+        new_chain = []
+        if isinstance(chain, list):
+            for step in chain:
+                if not isinstance(step, dict):
+                    continue
+                answer = str(step.get("answer") or "").strip()
+                if not answer:
+                    new_chain.append(step)
+                    continue
+                kept_text, hits = _ground_filter_text(answer, sources["causes"])
+                if hits:
+                    info["d4_kept"] += 1
+                    for h in hits:
+                        info["d4_sources"].append({
+                            "text": kept_text[:300],
+                            "source": h["source"],
+                            "kind": h["kind"],
+                        })
+                    new_chain.append({**step, "answer": kept_text})
+                else:
+                    info["d4_dropped"] += 1
+                    new_chain.append({**step, "answer": _D4_PENDING})
+        d4["why_chain"] = new_chain or [{"why": "根因（D4）", "answer": _D4_PENDING}]
+
+    if d5 is not None:
+        items = d5.get("items") if isinstance(d5.get("items"), list) else []
+        kept_items = []
+        for item in items:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            kept_text, hits = _ground_filter_text(text, sources["measures"])
+            if hits:
+                kept_items.append(kept_text)
+                info["d5_kept"] += 1
+                for h in hits:
+                    info["d5_sources"].append({
+                        "text": kept_text[:300],
+                        "source": h["source"],
+                        "kind": h["kind"],
+                    })
+            else:
+                info["d5_dropped"] += 1
+        d5["items"] = kept_items or [_D5_PENDING]
+
+    return report, info
+
+
+def _finalize_external_8d(
+    ext: dict, part: str, problem: str, db,
+    alert_id: str = "", fiscal_period: str = "",
+) -> dict:
+    """把对外 8D 返回整理为本地报告并落库（同步请求与后台任务共用）。"""
+    report_raw = ext.get("report") if isinstance(ext.get("report"), dict) else {}
+    # D4/D5 可追溯闸门：只保留 GraphRAG / 已关闭·已验证 8D 中的条目
+    report_raw, grounding = _apply_8d_grounding(report_raw, part, problem, db)
+    flat = flatten_external_8d_report(
+        report_raw,
+        part,
+        problem,
+        extra={
+            "ok": bool(ext.get("ok")),
+            "qualified": ext.get("qualified") or "",
+            "total_score": ext.get("total_score"),
+            "round_logs": ext.get("round_logs") or [],
+            "thread_id": ext.get("thread_id") or "",
+            "elapsed_s": ext.get("elapsed_s"),
+            "engine": ext.get("engine") or "langgraph",
+            "alert_id": alert_id,
+            "fiscal_period": fiscal_period,
+        },
+    )
+    # 知识来源改为可追溯结果，避免把未溯源条目标成“知识库已应用”
+    used_refs = []
+    if grounding["d4_kept"] or grounding["d5_kept"]:
+        used_refs.append({
+            "matched": grounding.get("phenomenon") or flat.get("part_number") or part,
+            "query": problem,
+            "match_type": "grounded_selection",
+            "processes": [grounding["process_name"]] if grounding.get("process_name") else [],
+            "root_causes": [
+                {"cause": s["text"], "category": s["source"]}
+                for s in grounding["d4_sources"]
+            ],
+            "countermeasures": [
+                {"measure": s["text"], "standard": s["source"]}
+                for s in grounding["d5_sources"]
+            ],
+            "source": "GraphRAG / 历史已验证 8D（仅保留可追溯条目）",
+            "evidence": f"料号 {part} · 未命中条目已转待现场确认",
+        })
+    knowledge_pack = {
+        "source": "GraphRAG + 已关闭/已验证 8D（仅可追溯条目）",
+        "source_url": GRAPHRAG_BASE_URL,
+        "applied": bool(used_refs),
+        "hit_count": grounding["d4_kept"] + grounding["d5_kept"],
+        "cause_count": grounding["d4_kept"],
+        "measure_count": grounding["d5_kept"],
+        "refs": used_refs,
+        "grounding": grounding,
+    }
+    flat["knowledge_refs_json"] = json.dumps(knowledge_pack, ensure_ascii=False)
+    flat["history_refs_json"] = json.dumps(grounding["history_refs"], ensure_ascii=False)
+    flat["data_policy"] = (
+        "external=langgraph; "
+        "d4_d5=GraphRAG+closed/verified_8D_only; "
+        f"d4_kept={grounding['d4_kept']};d4_dropped={grounding['d4_dropped']};"
+        f"d5_kept={grounding['d5_kept']};d5_dropped={grounding['d5_dropped']}; "
+        "external_status_recorded=evidence.meta.status; "
+        "auto_close=disabled; review_required=1"
+    )
+    try:
+        evidence = json.loads(flat.get("evidence_json") or "{}")
+    except Exception:
+        evidence = {}
+    evidence["grounding"] = grounding
+    evidence["data_sources"] = "MES + GraphRAG + 已关闭/已验证 8D（D4/D5 仅可追溯条目）"
+    if alert_id:
+        evidence["source_alert_id"] = alert_id
+    if fiscal_period:
+        evidence["fiscal_period"] = fiscal_period
+    flat["evidence_json"] = json.dumps(evidence, ensure_ascii=False, default=str)
+
+    # 落本地库，便于列表/编辑/PDF（对外接口本身默认不落库）
+    # 外部 c8d_number 可能与历史报告重号：自动追加短后缀，避免 UNIQUE 冲突丢失本次报告。
+    rno = str(flat.get("report_no") or "").strip()
+    if rno:
+        dup = db.find_8d_by_report_no(rno, flat.get("id") or "")
+        if dup:
+            flat["report_no"] = (
+                f"{rno}-{hashlib.md5(str(flat.get('id') or rno).encode()).hexdigest()[:4].upper()}"
+            )
+    db.save_8d(flat)
+    # 供前端编辑页直接使用结构化对象
+    for key, empty in (("evidence", "{}"), ("knowledge_refs", "{}"), ("defects", "[]")):
+        try:
+            flat[key] = json.loads(flat.get(f"{key}_json") or empty)
+        except Exception:
+            flat[key] = json.loads(empty)
+
+    msg = (ext.get("message") or "").strip() or "8D 已生成"
+    qualified = ext.get("qualified") or ""
+    total_score = ext.get("total_score")
+    if qualified or total_score is not None:
+        extra = " · ".join(
+            x for x in [
+                qualified or None,
+                f"{total_score}分" if total_score not in (None, "") else None,
+            ] if x
+        )
+        if extra and extra not in msg:
+            msg = f"{msg}（{extra}）"
+    dropped = grounding["d4_dropped"] + grounding["d5_dropped"]
+    if dropped:
+        msg = (
+            f"{msg}（已剔除 {dropped} 条无 GraphRAG/历史已验证 8D 依据的 "
+            "D4/D5 内容，改为待现场确认/待制定）"
+        )
+
+    return {
+        "report": flat,
+        "message": msg,
+        "ok": bool(ext.get("ok")),
+        "qualified": qualified,
+        "total_score": total_score,
+        "round_logs": ext.get("round_logs") or [],
+        "thread_id": ext.get("thread_id") or "",
+        "elapsed_s": ext.get("elapsed_s"),
+        "engine": ext.get("engine") or "langgraph",
+        "external_part_no": ext.get("part_no") or part,
+        "external_problem_desc": ext.get("problem_desc") or problem,
+        "grounding": grounding,
+    }
+
+
+# ═══════════════════════════════════════════════════
+# 8D 后台生成任务（前端轮询进度，避免单次请求干等 180s）
+# 任务只保存在本进程内存：重启后消失，查询返回 404 由前端提示重新生成
+# ═══════════════════════════════════════════════════
+
+_8D_JOBS: Dict[str, dict] = {}
+_8D_JOBS_LOCK = threading.Lock()
+_8D_JOB_TTL = 3600   # 结束后保留 1 小时，便于页面回来补取结果
+_8D_JOB_MAX = 100    # 内存任务上限，超出时丢弃最早的已结束任务
+_8D_MAX_WORKERS = 4  # 后台生成并发上限，防止请求洪峰耗尽线程
+_8D_WORKERS = threading.BoundedSemaphore(_8D_MAX_WORKERS)
+
+
+def _8d_job_prune_locked(now: float) -> None:
+    for jid, job in list(_8D_JOBS.items()):
+        if job.get("finished_at") and now - job["finished_at"] > _8D_JOB_TTL:
+            _8D_JOBS.pop(jid, None)
+    if len(_8D_JOBS) > _8D_JOB_MAX:
+        ended = sorted(
+            (job.get("finished_at"), jid)
+            for jid, job in _8D_JOBS.items()
+            if job.get("finished_at")
+        )
+        for _, jid in ended[: len(_8D_JOBS) - _8D_JOB_MAX]:
+            _8D_JOBS.pop(jid, None)
+
+
+def _8d_job_create(part: str, problem: str, alert_id: str = "", fiscal_period: str = "") -> dict:
+    now = time.time()
+    job = {
+        "id": uuid.uuid4().hex,
+        "status": "queued",
+        "phase": "已提交，排队中…",
+        "detail": "后台任务已创建，正在连接 8D 服务",
+        "part_no": part,
+        "problem_desc": problem,
+        "alert_id": alert_id or "",
+        "fiscal_period": fiscal_period or "",
+        "created_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "updated_at": now,
+        "result": None,
+        "error": "",
+    }
+    with _8D_JOBS_LOCK:
+        _8d_job_prune_locked(now)
+        _8D_JOBS[job["id"]] = job
+    return job
+
+
+def _8d_job_update(job_id: str, **fields) -> None:
+    with _8D_JOBS_LOCK:
+        job = _8D_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = time.time()
+
+
+def _8d_job_finish(job_id: str, status: str, *, result=None, error="") -> None:
+    now = time.time()
+    with _8D_JOBS_LOCK:
+        job = _8D_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = status
+        job["result"] = result
+        job["error"] = error
+        job["finished_at"] = now
+        job["updated_at"] = now
+        if status == "success":
+            job["phase"] = "生成完成"
+            job["detail"] = (result or {}).get("message") or "已写入本系统，可继续编辑"
+        else:
+            job["phase"] = "生成失败"
+            job["detail"] = error or "请检查料号/问题描述或 8D 服务状态后重试"
+
+
+def _8d_job_snapshot(job: dict) -> dict:
+    now = time.time()
+    end = job.get("finished_at") or now
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "phase": job.get("phase") or "",
+        "detail": job.get("detail") or "",
+        "part_no": job.get("part_no") or "",
+        "alert_id": job.get("alert_id") or "",
+        "fiscal_period": job.get("fiscal_period") or "",
+        "elapsed_s": round(max(0.0, end - job["created_at"]), 1),
+        "created_at": datetime.fromtimestamp(job["created_at"]).isoformat(timespec="seconds"),
+        "updated_at": datetime.fromtimestamp(job["updated_at"]).isoformat(timespec="seconds"),
+        "result": job.get("result"),
+        "error": job.get("error") or "",
+    }
+
+
+def _8d_job_get(job_id: str) -> Optional[dict]:
+    with _8D_JOBS_LOCK:
+        _8d_job_prune_locked(time.time())
+        job = _8D_JOBS.get(job_id)
+        return _8d_job_snapshot(job) if job else None
+
+
+def _run_8d_job(job_id: str, payload: dict, part: str, problem: str,
+                db, actor: str, role: str, ip: str,
+                alert_id: str = "", fiscal_period: str = "") -> None:
+    """后台线程：调用外部 8D 服务并落库；状态全程可查。"""
+    _8d_job_update(
+        job_id,
+        status="running",
+        started_at=time.time(),
+        phase="调用 8D 服务…",
+        detail="LangGraph 闭环通常 1–3 分钟；任务在后台运行，可离开本页稍后回来",
+    )
+    try:
+        ext = call_external_8d_generate(payload)
+        _8d_job_update(
+            job_id,
+            phase="整理 D1–D8 并写入本地库…",
+            detail="解析实据与知识引用",
+        )
+        result = _finalize_external_8d(
+            ext, part, problem, db,
+            alert_id=alert_id, fiscal_period=fiscal_period,
+        )
+        score = result.get("total_score")
+        try:
+            db.log_audit(
+                actor, role, ip, "8d_generate",
+                result["report"].get("report_no") or part,
+                f"part={part} ok={result['ok']} qualified={result.get('qualified') or ''} "
+                f"score={score if score is not None else ''} async=1",
+            )
+        except Exception as e:
+            logger.warning("审计写入失败 8d_generate: %s", e)
+        _8d_job_finish(job_id, "success", result=result)
+    except External8DError as e:
+        _8d_job_finish(job_id, "error", error=e.message)
+    except Exception as e:
+        logger.exception("后台 8D 生成失败: %s", e)
+        _8d_job_finish(job_id, "error", error=f"生成失败: {e}")
+
+
+def _run_8d_job_guarded(*args) -> None:
+    """包装后台任务，结束时归还并发槽位。"""
+    try:
+        _run_8d_job(*args)
+    finally:
+        _8D_WORKERS.release()
+
+
+# ═══════════════════════════════════════════════════
 # 请求参数校验（阻断 SQL 注入：只接受合法格式，拒绝引号/注释/控制字符）
 # ═══════════════════════════════════════════════════
 
@@ -5637,6 +8091,21 @@ _FP_RE = re.compile(r"^(19|20)\d{4}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _PERIOD_RE = re.compile(r"^(\d{4}-\d{2}|\d{6})$")
 _DIGITS_RE = re.compile(r"^\d{1,6}$")
+
+# 安全响应头：脚本/样式需允许内联（现有前端为单文件内联实现）；
+# ECharts 已本地化到 web/vendor/，不再放行外部 CDN。
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "object-src 'none'"
+)
 
 
 def _is_loopback(host: str) -> bool:
@@ -5651,6 +8120,7 @@ def validate_params(params: Dict[str, List[str]]) -> Optional[str]:
                 continue
             value = str(raw)
             if key == "token":
+                # URL 令牌已在 do_GET 入口统一拒绝；此处不参与 SQL 字符校验
                 continue
             if key == "fiscal_period" and not _FP_RE.match(value):
                 return f"fiscal_period 须为 6 位周期（如 202611）：{value[:20]}"
@@ -5675,18 +8145,20 @@ def validate_params(params: Dict[str, List[str]]) -> Optional[str]:
 
 class PCBQualityHandler(BaseHTTPRequestHandler):
     system = None
+    # 单连接读写超时：慢客户端不得长期占用工作线程
+    timeout = 30
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        # 令牌引导：仅在未强制登录时允许 ?token= 写入 Cookie（强制登录须走 ERP 会话）
-        if path.endswith(".html") and params.get("token"):
-            if REQUIRE_LOGIN:
-                self._redirect("/login.html")
-                return
-            self._bootstrap_token(path, params["token"][0])
+        # URL 令牌已禁用：会进入访问日志 / Referer / 浏览器历史
+        if params.get("token"):
+            self._err(
+                403,
+                "已禁用 URL 令牌：浏览器请打开 /login.html 登录，自动化请使用 X-API-Token 请求头",
+            )
             return
 
         try:
@@ -5721,8 +8193,12 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 self._project_env_get()
             elif path == "/api/defect_mapping":
                 self._defect_mapping_get(params)
+            elif path == "/api/processes":
+                self._processes_catalog()
             elif path == "/api/dashboard":
                 self._dashboard(params)
+            elif path == "/api/part_spotlight":
+                self._part_spotlight(params)
             elif path == "/api/health_check":
                 self._health_report(params)
             elif path == "/api/scrap":
@@ -5735,6 +8211,8 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 self._trace(params)
             elif path == "/api/8d/list":
                 self._8d_list(params)
+            elif path == "/api/8d/job":
+                self._8d_job(params)
             elif path == "/api/8d/get":
                 self._8d_get(params)
             elif path == "/api/8d/export":
@@ -5745,6 +8223,8 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 self._alerts(params)
             elif path == "/api/knowledge":
                 self._knowledge(params)
+            elif path == "/api/parts":
+                self._parts(params)
             elif path == "/api/periods":
                 self._periods(params)
             elif path == "/api/history":
@@ -5794,8 +8274,33 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._err(400, "Content-Length 非法")
+            return
+        if length < 0:
+            self._err(400, "Content-Length 非法")
+            return
+        if length > MAX_BODY_BYTES:
+            # 未读取请求体：本连接不可复用
+            self.close_connection = True
+            self._err(413, f"请求体过大（上限 {MAX_BODY_BYTES} 字节）")
+            return
+        body = {}
+        if length > 0:
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                self._err(400, "请求体不完整")
+                return
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._err(400, "请求体须为合法 JSON")
+                return
+            if not isinstance(body, dict):
+                self._err(400, "请求体须为 JSON 对象")
+                return
 
         try:
             if path == "/api/auth/login":
@@ -5808,6 +8313,16 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 self._err(401, "未登录：请先打开 /login.html 使用 ERP/MES 账号登录")
                 return
             params = {k: [v] for k, v in (body or {}).items()}
+            # 管理操作：QA_ADMIN_ROLES 为空时不限制；配置后仅管理员角色/服务令牌可执行
+            admin_only = {
+                "/api/8d/delete",
+                "/api/8d/purge_invalid",
+                "/api/history/purge_empty",
+                "/api/sync/bridge",
+            }
+            if path in admin_only and not self._is_admin():
+                self._err(403, "无权限：该操作仅限管理员角色（QA_ADMIN_ROLES）")
+                return
             # 仅对会进入 SQL 拼接的参数做校验；8D/学习正文走参数化存储，不限制标点
             if path in (
                 "/api/8d/delete", "/api/8d/purge_invalid",
@@ -5868,9 +8383,6 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 return value.strip()
         return ""
 
-    def _cookie_token(self) -> str:
-        return self._cookie_value("qa_token")
-
     def _session_id(self) -> str:
         return self._cookie_value("qa_sid")
 
@@ -5878,10 +8390,20 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         return get_session_store(SESSION_TTL_SECONDS).get(self._session_id())
 
     def _client_ip(self) -> str:
-        xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        if xff:
-            return xff
-        return (self.client_address[0] if self.client_address else "") or "unknown"
+        peer = (self.client_address[0] if self.client_address else "") or "unknown"
+        mode = (TRUST_PROXY or "auto").strip().lower()
+        if mode in ("0", "false", "no", "off"):
+            return peer
+        # auto：仅信任同机反向代理（本机回环对端）转发的头
+        trust = mode in ("1", "true", "yes", "on") or _is_loopback(peer)
+        if trust:
+            real = (self.headers.get("X-Real-IP") or "").strip()
+            if real:
+                return real[:64]
+            xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            if xff:
+                return xff[:64]
+        return peer
 
     def _cookie_secure(self) -> bool:
         mode = (COOKIE_SECURE_MODE or "auto").strip().lower()
@@ -5895,23 +8417,22 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             return True
         return False
 
-    def _has_api_token(self, *, allow_cookie: bool = True) -> bool:
+    def _has_api_token(self) -> bool:
+        """服务令牌只接受请求头；不接受 URL 参数与 Cookie（防日志/Referer 泄露）。"""
         if not API_TOKEN:
             return False
         supplied = (self.headers.get("X-API-Token") or "").strip()
         auth = (self.headers.get("Authorization") or "").strip()
         if not supplied and auth.lower().startswith("bearer "):
             supplied = auth[7:].strip()
-        if not supplied and allow_cookie:
-            supplied = self._cookie_token()
         return bool(supplied) and hmac.compare_digest(supplied, API_TOKEN)
 
     def _authorized(self) -> bool:
         # 1) ERP/MES 登录会话
         if self._current_session() is not None:
             return True
-        # 2) 服务令牌：强制登录时仅允许 Header（禁止 Cookie 冒充浏览器会话）
-        if self._has_api_token(allow_cookie=not REQUIRE_LOGIN):
+        # 2) 服务令牌（仅请求头）
+        if self._has_api_token():
             return True
         # 3) 未强制登录且未配置令牌 → 开发免登
         if not REQUIRE_LOGIN and not API_TOKEN:
@@ -5925,6 +8446,45 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         if not REQUIRE_LOGIN:
             return self._authorized()
         return False
+
+    def _is_admin(self) -> bool:
+        """管理操作鉴权：未配置 QA_ADMIN_ROLES 时放行；服务令牌视为管理员。"""
+        if not ADMIN_ROLES:
+            return True
+        sess = self._current_session()
+        if sess is not None:
+            return (sess.role or "").strip().lower() in ADMIN_ROLES
+        return self._has_api_token()
+
+    def _actor(self) -> tuple[str, str]:
+        """当前操作人 (username, role)：会话优先，其次服务令牌，最后匿名。"""
+        sess = self._current_session()
+        if sess is not None:
+            return sess.username or "", (sess.role or "user")
+        if self._has_api_token():
+            return "service", "token"
+        return "anonymous", ""
+
+    def _audit(self, action: str, target: str = "", detail: str = "") -> None:
+        actor, role = self._actor()
+        try:
+            self.system.db.log_audit(
+                actor, role, self._client_ip(), action, target, detail
+            )
+        except Exception as e:
+            logger.warning("审计写入失败 %s: %s", action, e)
+
+    def end_headers(self):
+        # 统一补充安全响应头（JSON/静态页/下载/重定向/错误均生效）
+        for key, value in (
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-Frame-Options", "SAMEORIGIN"),
+            ("Referrer-Policy", "same-origin"),
+            ("Permissions-Policy", "geolocation=(), microphone=(), camera=()"),
+            ("Content-Security-Policy", _CSP),
+        ):
+            self.send_header(key, value)
+        super().end_headers()
 
     def _auth_config(self):
         """登录页配置：企业列表与环境标签（公开）。"""
@@ -5974,14 +8534,23 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             )
         except PermissionError as e:
             record_login_failure(client_ip)
-            self._err(401, str(e) or "账号或密码错误")
+            try:
+                self.system.db.log_audit(
+                    username, "", client_ip, "login_failed",
+                    target=enterprise, detail=str(e)[:200],
+                )
+            except Exception:
+                pass
+            # 对外不区分「账号不存在/密码错误/上游 4xx 细节」，避免账号枚举与信息泄露
+            self._err(401, "账号或密码错误")
             return
         except ConnectionError as e:
-            self._err(502, str(e))
+            logger.warning("ERP/MES 登录服务连接失败: %s", e)
+            self._err(502, "无法连接 ERP/MES 登录服务，请稍后重试")
             return
         except Exception as e:
             logger.exception("ERP 登录失败: %s", e)
-            self._err(502, f"登录失败：{e}")
+            self._err(502, "登录服务暂不可用，请稍后重试")
             return
 
         clear_login_failures(client_ip)
@@ -5992,6 +8561,13 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             role=result.get("role") or "",
             erp_token=result.get("access_token") or "",
         )
+        try:
+            self.system.db.log_audit(
+                sess.username, sess.role or "user", client_ip, "login",
+                target=sess.enterprise_code, detail="success",
+            )
+        except Exception as e:
+            logger.warning("登录审计写入失败: %s", e)
         cookie = session_cookie_header(
             sess.sid,
             max_age=SESSION_TTL_SECONDS,
@@ -6013,10 +8589,18 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _auth_logout(self):
-        """退出登录：清除会话 Cookie。"""
+        """退出登录：清除会话 Cookie 与遗留的令牌 Cookie。"""
         sid = self._session_id()
+        sess = self._current_session()
         if sid:
             get_session_store(SESSION_TTL_SECONDS).delete(sid)
+        if sess is not None:
+            try:
+                self.system.db.log_audit(
+                    sess.username, sess.role or "user", self._client_ip(), "logout"
+                )
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header(
@@ -6024,6 +8608,12 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             session_cookie_header(
                 "", max_age=0, clear=True, secure=self._cookie_secure()
             ),
+        )
+        # 清理历史版本写入的 qa_token（现已不再接受该 Cookie 鉴权）
+        self.send_header(
+            "Set-Cookie",
+            "qa_token=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+            + ("; Secure" if self._cookie_secure() else ""),
         )
         self._cors_headers()
         payload = json.dumps({"success": True, "message": "已退出登录"}, ensure_ascii=False).encode("utf-8")
@@ -6038,36 +8628,13 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             self._ok({"user": sess.to_public(), "auth": "session"})
             return
         # 强制登录时 /me 不把服务令牌当成「已登录用户」（避免登录页误跳转）
-        if not REQUIRE_LOGIN and API_TOKEN and self._has_api_token(allow_cookie=True):
+        if not REQUIRE_LOGIN and API_TOKEN and self._has_api_token():
             self._ok({
                 "user": {"username": "service", "role": "token", "enterprise_code": ""},
                 "auth": "api_token",
             })
             return
         self._err(401, "未登录")
-
-    def _bootstrap_token(self, path: str, token: str) -> None:
-        if not API_TOKEN:
-            self._redirect(safe_internal_next(path))
-            return
-        if not hmac.compare_digest((token or "").strip(), API_TOKEN):
-            self.send_response(403)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(
-                "<meta charset='utf-8'><h3>访问令牌无效</h3>"
-                "<p>请输入 .env 中 QA_API_TOKEN 的值后重试。</p>".encode("utf-8")
-            )
-            return
-        secure = "; Secure" if self._cookie_secure() else ""
-        cookie = (
-            f"qa_token={API_TOKEN}; HttpOnly; SameSite=Lax; Path=/; "
-            f"Max-Age=2592000{secure}"
-        )
-        self.send_response(302)
-        self.send_header("Set-Cookie", cookie)
-        self.send_header("Location", safe_internal_next(path))
-        self.end_headers()
 
     def _redirect(self, path: str) -> None:
         self.send_response(302)
@@ -6161,6 +8728,7 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         try:
             from app.bridge_sync_worker import run_bridge_sync
             stats = run_bridge_sync(db_path)
+            self._audit("sync_bridge", db_path, json.dumps(stats, ensure_ascii=False, default=str)[:800])
             self._ok({
                 "message": "生产桥接同步完成",
                 "db": db_path,
@@ -6168,6 +8736,7 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             logger.exception("桥接同步失败: %s", e)
+            self._audit("sync_bridge_failed", db_path, str(e)[:300])
             self._err(500, "桥接同步失败，请查看服务端日志")
 
     def _project_env_get(self):
@@ -6198,11 +8767,40 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 info["trial"] = map_erp_defects(names)
         self._ok(info)
 
+    def _processes_catalog(self):
+        """标准工序列表（与 MES/ERP process_catalog 对齐，供筛选下拉）。"""
+        self._ok(process_catalog_payload())
+
     def _dashboard(self, params=None):
-        """仪表板接口，支持fiscal_period参数"""
+        """仪表板总览。
+
+        适用页面：品质总览；含 KPI、闭环状态条、口径说明、TOP 料号。
+        查询参数：fiscal_period — ERP 周期码 YYYYMM，默认当月。
+        """
         params = params or {}
         fiscal_period = params.get("fiscal_period", [None])[0]
         self._ok(self.system.get_dashboard(fiscal_period))
+
+    def _part_spotlight(self, params=None):
+        """异常料号决策卡。
+
+        适用页面：品质总览「异常料号一张卡」；点击 TOP 报废料号柱图打开。
+        查询参数：
+          - part 或 part_number：料号（必填，二者任一）
+          - fiscal_period：ERP 周期码 YYYYMM，默认当月
+        """
+        params = params or {}
+        # 兼容 part / part_number（前端与脚本两种写法）
+        part = (
+            params.get("part", [""])[0]
+            or params.get("part_number", [""])[0]
+            or ""
+        ).strip()
+        fiscal_period = (params.get("fiscal_period", [None])[0] or "").strip() or None
+        if not part:
+            self._err(400, "请选择料号（参数 part 或 part_number）")
+            return
+        self._ok(self.system.get_part_spotlight(part, fiscal_period=fiscal_period))
 
     def _health_report(self, params):
         part = (params.get("part", [""])[0] or "").strip()
@@ -6266,6 +8864,26 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             days = 30
         self._ok(self.system.get_ipqc_analysis(day_count=days, process_name=process))
 
+    def _parts(self, params):
+        """料号下拉列表。
+
+        适用页面：体检/报废/追溯/客诉/8D/历史等所有料号筛选与必填项。
+        查询参数：
+          - fiscal_period：可选，ERP 周期码 YYYYMM；默认当月
+          - limit：最多返回条数，默认 300
+          - q：料号/名称模糊过滤
+        """
+        params = params or {}
+        fp = (params.get("fiscal_period", [None])[0] or "").strip() or None
+        if not fp:
+            fp = datetime.now().strftime("%Y%m")
+        q = (params.get("q", [""])[0] or "").strip() or None
+        try:
+            limit = int((params.get("limit", ["300"])[0] or 300))
+        except Exception:
+            limit = 300
+        self._ok(self.system.get_part_options(fiscal_period=fp, limit=limit, q=q))
+
     def _periods(self, params):
         """获取可用周期列表（返回FiscalPeriod周期码）"""
         part = params.get("part", [""])[0]
@@ -6283,12 +8901,19 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            where = "InspectionResult = 'Scrapped'"
+            # 周期列表按生产报废口径（排除非量产工序/项目/测试/TEST-）
+            where = self.system._scrap_non_production_sql()
+            where_params = []
             if part:
-                where += f" AND MfgPartCode LIKE '%{part}%'"
+                where += " AND v.MfgPartCode LIKE ?"
+                where_params.append(f"%{part}%")
             
             # 返回FiscalPeriod（ERP系统标准周期码，格式YYYYMM）
-            r = erp.execute(f"SELECT DISTINCT TOP 24 FiscalPeriod FROM View_P_Inspection WHERE {where} ORDER BY FiscalPeriod DESC")
+            r = erp.execute(
+                "SELECT DISTINCT TOP 24 v.FiscalPeriod FROM View_P_Inspection v "
+                f"WHERE {where} ORDER BY v.FiscalPeriod DESC",
+                where_params,
+            )
             if r.get("success"):
                 fiscal_periods = [row["FiscalPeriod"] for row in r.get("data", []) if row.get("FiscalPeriod")]
                 result["fiscal_periods"] = fiscal_periods
@@ -6325,11 +8950,13 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             pdf_path = generate_health_check_pdf(
                 health,
                 part,
-                fiscal_period=fiscal_period or period.replace('-', '') if period else None,
+                fiscal_period=fiscal_period or (str(period).replace('-', '') if period else None),
                 output_dir=str(OUTPUT_DIR),
             )
 
             filename = os.path.basename(pdf_path)
+            _cleanup_output_dir()
+            self._audit("export_health_pdf", filename, f"part={part} period={fiscal_period or period or ''}")
 
             self._ok({
                 "success": True,
@@ -6402,10 +9029,18 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                     part or None, start, end, period=period, fiscal_period=fiscal_period
                 )
             else:  # process
-                data = self.system.get_process_yield(part or None, fiscal_period=fiscal_period or None)
+                data = self.system.get_process_yield(
+                    part or None, fiscal_period=fiscal_period or None,
+                    start_date=start, end_date=end,
+                )
 
             xlsx_path = export_module_excel(module, data or {}, str(OUTPUT_DIR), extra=extra)
             filename = os.path.basename(xlsx_path)
+            _cleanup_output_dir()
+            self._audit(
+                "export_excel", filename,
+                f"module={module} part={part or ''} period={fiscal_period or period or ''}",
+            )
             self._ok({
                 "success": True,
                 "format": "xlsx",
@@ -6416,8 +9051,8 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 "message": f"已导出 Excel: {filename}",
             })
         except Exception as e:
-            logger.error(f"Excel 导出失败: {e}")
-            self._err(500, f"Excel 导出失败: {e}")
+            logger.exception("Excel 导出失败: %s", e)
+            self._err(500, "Excel 导出失败，请查看服务端日志")
 
     def _resolve_8d_report(self, report_id=None, report_no=None):
         """按 id 或 report_no 取 8D 报告。"""
@@ -6429,7 +9064,9 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 return r
         if rno:
             rows = self.system.db.query(
-                "SELECT * FROM eightd_reports WHERE report_no=? LIMIT 1", (rno,)
+                "SELECT * FROM eightd_reports WHERE report_no=? "
+                "AND IFNULL(deleted_at,'')='' LIMIT 1",
+                (rno,),
             )
             if rows:
                 return rows[0]
@@ -6471,6 +9108,8 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             import urllib.parse
             pdf_path = generate_8d_pdf(report, output_dir=str(OUTPUT_DIR))
             filename = os.path.basename(pdf_path)
+            _cleanup_output_dir()
+            self._audit("export_8d_pdf", filename, f"report_no={report.get('report_no') or ''}")
             self._ok({
                 "format": "pdf",
                 "filename": filename,
@@ -6481,8 +9120,8 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 "message": f"8D 报告已导出: {filename}",
             })
         except Exception as e:
-            logger.error(f"8D PDF生成失败: {e}")
-            self._err(500, f"8D PDF生成失败: {e}")
+            logger.exception("8D PDF生成失败: %s", e)
+            self._err(500, "8D PDF生成失败，请查看服务端日志")
 
     def _download_file(self, filename):
         """文件下载（output/ 下的 PDF / Excel）"""
@@ -6527,16 +9166,30 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             self._err(500, "文件下载失败")
 
     def _process(self, params):
-        """工序良率；可选 part、fiscal_period（按当月工单关联 MES）。"""
+        """工序良率；可选 part、fiscal_period 或 start/end（按关联工单限定 MES）。"""
         part = params.get("part", [""])[0]
         fiscal_period = params.get("fiscal_period", [None])[0]
-        self._ok(self.system.get_process_yield(part or None, fiscal_period=fiscal_period or None))
+        start = params.get("start", [None])[0]
+        end = params.get("end", [None])[0]
+        self._ok(self.system.get_process_yield(
+            part or None, fiscal_period=fiscal_period or None,
+            start_date=start, end_date=end,
+        ))
 
     def _work_orders(self, params):
         part = params.get("part", [""])[0]
         start = params.get("start", [None])[0]
         end = params.get("end", [None])[0]
-        self._ok(self.system.get_work_orders(part or None, start, end))
+        period = params.get("period", [None])[0]
+        fiscal_period = params.get("fiscal_period", [None])[0]
+        if not fiscal_period and period:
+            fp = str(period).replace("-", "")
+            if len(fp) == 6 and fp.isdigit():
+                fiscal_period = fp
+                start = end = None
+        self._ok(self.system.get_work_orders(
+            part or None, start, end, fiscal_period=fiscal_period or None,
+        ))
 
     def _trace(self, params):
         """一键追溯：ERP 工单/MRB + MES 工序良率/不良/检验履历"""
@@ -6558,16 +9211,21 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         scrap = self.system.get_scrap_analysis(
             part, start, end, period=period, fiscal_period=fiscal_period
         )
-        proc = self.system.get_process_yield(part, fiscal_period=fiscal_period)
+        proc = self.system.get_process_yield(
+            part, fiscal_period=fiscal_period,
+            start_date=start if not fiscal_period else None,
+            end_date=end if not fiscal_period else None,
+        )
         wo = self.system.get_work_orders(part, start, end, fiscal_period=fiscal_period)
 
         scrap_pcs = int(scrap.get("total_scrap_pcs") or 0)
         stock_pcs = int(scrap.get("total_in_stock_pcs") or 0)
-        # 与总览统一：投入=入库+报废，报废率=报废/(入库+报废)
+        # 与总览统一：投入=入库+报废，报废率=报废/(入库+报废)；无入库基数不给率
         input_base = scrap_pcs + stock_pcs
-        scrap_rate = round(scrap_pcs * 100.0 / input_base, 2) if input_base > 0 else float(scrap.get("scrap_rate") or 0)
+        rate_reliable = bool(scrap.get("rate_reliable"))
+        scrap_rate = float(scrap.get("scrap_rate")) if rate_reliable and scrap.get("scrap_rate") is not None else None
         pass_qty = stock_pcs
-        pass_rate = round(100.0 - scrap_rate, 2) if input_base > 0 else 0
+        pass_rate = round(100.0 - scrap_rate, 2) if scrap_rate is not None else None
 
         self._ok({
             "success": True,
@@ -6579,6 +9237,7 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 "total_input": input_base or wo.get("total_input_pcs", 0),
                 "total_reject": scrap_pcs,
                 "reject_rate": scrap_rate,
+                "rate_reliable": rate_reliable,
                 "mrb_reject": scrap_pcs,
                 "pass_qty": pass_qty,
                 "pass_rate": pass_rate,
@@ -6613,8 +9272,11 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
     def _8d_list(self, params):
         part = params.get("part", [""])[0]
         status = params.get("status", [""])[0]
+        fiscal_period = params.get("fiscal_period", [""])[0]
         self._ok({
-            "reports": self.system.db.get_8d_list(part or None, status or None),
+            "reports": self.system.db.get_8d_list(
+                part or None, status or None, fiscal_period=fiscal_period or None,
+            ),
             "policy": "D2 指标来自 ERP/MES；D4/D5 仅引用已关闭历史或标注待填写",
         })
 
@@ -6658,7 +9320,11 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             else:
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(content))
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            if path.startswith("/vendor/"):
+                # 第三方库（如本地化 ECharts）：可长缓存，避免每次整包重下
+                self.send_header("Cache-Control", "public, max-age=86400")
+            else:
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(content)
         except FileNotFoundError:
@@ -6692,6 +9358,38 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             or ""
         )
         problem = str(problem).strip()
+
+        # 预警来源关联：alert_id → 自动带出料号/问题/周期，并把关联落到 8D 报告
+        alert_id = str(body.get("alert_id") or "").strip()
+        fiscal_period = str(body.get("fiscal_period") or "").strip()
+        period = str(body.get("period") or "").strip()
+        if fiscal_period and not _FP_RE.match(fiscal_period):
+            self._err(400, "fiscal_period 格式应为 YYYYMM")
+            return
+        if not fiscal_period and period:
+            parts = _period_parts(period)
+            if not parts:
+                self._err(400, f"周期格式无效：{period}")
+                return
+            fiscal_period = parts[0]
+        if alert_id:
+            alert = self.system.db.get_alert(alert_id)
+            if not alert:
+                self._err(404, "来源预警不存在")
+                return
+            alert_part = str(alert.get("part_number") or "").strip()
+            if not part and alert_part and alert_part != "全厂":
+                part = alert_part
+            if not problem:
+                problem = str(alert.get("message") or "").strip() or f"品质预警：{alert_id}"
+            if not fiscal_period:
+                fp0 = str(alert.get("fiscal_period") or "").strip()
+                if fp0:
+                    fiscal_period = fp0
+                else:
+                    d0 = re.sub(r"[^0-9]", "", str(alert.get("created_at") or ""))[:6]
+                    fiscal_period = d0 if _FP_RE.match(d0 or "") else ""
+
         if not part:
             self._err(400, "缺少料号 part_no")
             return
@@ -6707,6 +9405,12 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
                 self._err(400, "max_agent_rounds 须为 1–10 的整数")
                 return
 
+        # async=true：立即返回 job_id，生成在后台进行，前端轮询 /api/8d/job
+        if str(body.get("async")).strip().lower() in ("1", "true", "yes", "on"):
+            self._8d_generate_async(part, problem, payload, alert_id=alert_id,
+                                    fiscal_period=fiscal_period)
+            return
+
         try:
             ext = call_external_8d_generate(payload)
         except External8DError as e:
@@ -6717,64 +9421,59 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             self._err(502, f"调用 8D 服务失败: {e}")
             return
 
-        report_raw = ext.get("report") if isinstance(ext.get("report"), dict) else {}
-        flat = flatten_external_8d_report(
-            report_raw,
-            part,
-            problem,
-            extra={
-                "ok": bool(ext.get("ok")),
-                "qualified": ext.get("qualified") or "",
-                "total_score": ext.get("total_score"),
-                "round_logs": ext.get("round_logs") or [],
-                "thread_id": ext.get("thread_id") or "",
-                "elapsed_s": ext.get("elapsed_s"),
-                "engine": ext.get("engine") or "langgraph",
-            },
+        res = _finalize_external_8d(
+            ext, part, problem, self.system.db,
+            alert_id=alert_id, fiscal_period=fiscal_period,
         )
-        # 落本地库，便于列表/编辑/PDF（对外接口本身默认不落库）
-        self.system.db.save_8d(flat)
-        # 供前端编辑页直接使用结构化对象
-        try:
-            flat["evidence"] = json.loads(flat.get("evidence_json") or "{}")
-        except Exception:
-            flat["evidence"] = {}
-        try:
-            flat["knowledge_refs"] = json.loads(flat.get("knowledge_refs_json") or "{}")
-        except Exception:
-            flat["knowledge_refs"] = {}
-        try:
-            flat["defects"] = json.loads(flat.get("defects_json") or "[]")
-        except Exception:
-            flat["defects"] = []
+        score = res.get("total_score")
+        self._audit(
+            "8d_generate",
+            res["report"].get("report_no") or part,
+            f"part={part} ok={res['ok']} qualified={res.get('qualified') or ''} "
+            f"score={score if score is not None else ''}",
+        )
+        self._ok(res)
 
-        msg = (ext.get("message") or "").strip() or "8D 已生成"
-        qualified = ext.get("qualified") or ""
-        total_score = ext.get("total_score")
-        ok = bool(ext.get("ok"))
-        if qualified or total_score is not None:
-            extra = " · ".join(
-                x for x in [
-                    qualified or None,
-                    f"{total_score}分" if total_score not in (None, "") else None,
-                ] if x
-            )
-            if extra and extra not in msg:
-                msg = f"{msg}（{extra}）"
-
+    def _8d_generate_async(self, part: str, problem: str, payload: dict,
+                           alert_id: str = "", fiscal_period: str = ""):
+        """提交后台生成任务；操作人/角色/IP 在响应前取好，供后台线程写审计。"""
+        if not _8D_WORKERS.acquire(blocking=False):
+            self._err(429, f"8D 生成任务已达并发上限（{_8D_MAX_WORKERS}），请稍后重试")
+            return
+        try:
+            actor, role = self._actor()
+            ip = self._client_ip()
+            job = _8d_job_create(part, problem, alert_id=alert_id, fiscal_period=fiscal_period)
+            threading.Thread(
+                target=_run_8d_job_guarded,
+                args=(job["id"], dict(payload), part, problem,
+                      self.system.db, actor, role, ip, alert_id, fiscal_period),
+                name=f"8d-job-{job['id'][:8]}",
+                daemon=True,
+            ).start()
+        except Exception:
+            _8D_WORKERS.release()
+            raise
         self._ok({
-            "report": flat,
-            "message": msg,
-            "ok": ok,
-            "qualified": qualified,
-            "total_score": total_score,
-            "round_logs": ext.get("round_logs") or [],
-            "thread_id": ext.get("thread_id") or "",
-            "elapsed_s": ext.get("elapsed_s"),
-            "engine": ext.get("engine") or "langgraph",
-            "external_part_no": ext.get("part_no") or part,
-            "external_problem_desc": ext.get("problem_desc") or problem,
+            "job_id": job["id"],
+            "status": job["status"],
+            "async": True,
+            "alert_id": alert_id,
+            "fiscal_period": fiscal_period,
+            "message": "已提交后台生成，页面会自动刷新进度",
         })
+
+    def _8d_job(self, params):
+        """查询后台 8D 任务状态；任务在内存中，重启后返回 404。"""
+        job_id = (params.get("id", [""])[0] or "").strip()
+        if not job_id:
+            self._err(400, "缺少任务 id")
+            return
+        snap = _8d_job_get(job_id)
+        if not snap:
+            self._err(404, "任务不存在或已过期，请重新生成")
+            return
+        self._ok({"job": snap})
 
     def _8d_knowledge_lookup(self, params):
         """
@@ -6822,24 +9521,62 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             body["knowledge_refs_json"] = json.dumps(
                 body.pop("knowledge_refs"), ensure_ascii=False
             )
-        # 关闭时回写已验证知识
+        prev = self.system.db.get_8d(body["id"], include_deleted=True)
+        if prev and (prev.get("deleted_at") or "").strip():
+            self._err(409, "该 8D 报告已删除，不能继续编辑；请新建报告")
+            return
+        # 报告编号唯一（软删除报告不占用编号）
+        report_no = str(body.get("report_no") or (prev or {}).get("report_no") or "").strip()
+        if report_no:
+            dup = self.system.db.find_8d_by_report_no(report_no, body["id"])
+            if dup:
+                self._err(409, f"报告编号 {report_no} 已被 {dup.get('id')} 使用")
+                return
+            body["report_no"] = report_no
+        # 状态机：仅 open/closed；关闭须通过确定性校验，且只在 open→closed 迁移时回写知识
+        status = body.get("status") or (prev or {}).get("status") or "open"
+        if status not in ("open", "closed"):
+            self._err(400, f"不支持的报告状态：{status}")
+            return
         promoted = 0
-        prev = self.system.db.get_8d(body["id"])
-        status = body.get("status") or (prev or {}).get("status")
-        if status == "closed":
-            body["closed_at"] = body.get("closed_at") or datetime.now().isoformat()
+        is_closing = status == "closed" and (prev or {}).get("status") != "closed"
+        if is_closing:
             merged = {**(prev or {}), **body}
+            blockers = validate_8d_closure(merged)
+            if blockers:
+                self._err(400, "关闭校验未通过：" + "；".join(blockers))
+                return
+            body["closed_at"] = body.get("closed_at") or datetime.now().isoformat()
             promoted = self.system.db.promote_8d_knowledge(merged)
+        elif status == "closed":
+            # 已关闭报告再次编辑：内容有变化仍须通过关闭校验，不能借「已关闭」绕过
+            if _8d_content_changed(body, prev):
+                merged = {**(prev or {}), **body}
+                blockers = validate_8d_closure(merged)
+                if blockers:
+                    self._err(400, "已关闭报告的修改未通过关闭校验：" + "；".join(blockers))
+                    return
+            body["closed_at"] = body.get("closed_at") or (prev or {}).get("closed_at") or ""
+        else:
+            body["closed_at"] = ""
         # 只写表字段
         allow = {
             "id", "report_no", "part_number", "customer", "problem",
             "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8",
             "defects_json", "evidence_json", "history_refs_json",
             "knowledge_refs_json", "data_policy",
+            "alert_id", "fiscal_period",
             "status", "severity", "created_by", "created_at", "updated_at", "closed_at",
         }
         row = {k: v for k, v in body.items() if k in allow}
+        if prev is None and not row.get("created_by"):
+            row["created_by"] = self._actor()[0]
         self.system.db.save_8d(row)
+        self._audit(
+            "8d_save",
+            row.get("report_no") or body["id"],
+            f"status={status or ''} promoted={promoted}",
+        )
         self._ok({
             "message": "保存成功" + (f"；已回写验证知识 {promoted} 条" if promoted else ""),
             "promoted_knowledge": promoted,
@@ -6850,11 +9587,20 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         if not rid:
             self._err(400, "缺少id")
             return
+        prev = self.system.db.get_8d(rid, include_deleted=True)
+        if not prev or (prev.get("deleted_at") or "").strip():
+            self._err(404, "未找到该 8D 报告")
+            return
         self.system.db.delete_8d(rid)
-        self._ok({"message": "已删除", "id": rid})
+        self._audit(
+            "8d_delete", rid,
+            f"soft=1 report_no={prev.get('report_no') or ''} part={prev.get('part_number') or ''}",
+        )
+        self._ok({"message": "已删除（可在知识库审计日志追溯）", "id": rid})
 
     def _8d_purge(self, params=None):
         purged = self.system.db.purge_invalid_8d()
+        self._audit("8d_purge_invalid", detail=f"purged={len(purged)}")
         self._ok({"message": f"已清理无效报告 {len(purged)} 条", "purged": purged})
 
     def _alerts(self, params):
@@ -6862,13 +9608,16 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         acknowledged = None if ack is None or ack == "" else (ack == "true" or ack == "1")
         alert_type = params.get("type", [None])[0] or None
         level = params.get("level", [None])[0] or None
+        fiscal_period = (params.get("fiscal_period", [""])[0] or "").strip() or None
         alerts = self.system.db.get_alerts(
-            acknowledged=acknowledged, alert_type=alert_type, level=level, limit=200
+            acknowledged=acknowledged, alert_type=alert_type, level=level, limit=200,
+            fiscal_period=fiscal_period,
         )
-        # 卡片汇总：含全部确认状态，不受 ack/level 影响（类型筛选仍生效）
-        # 未确认+已确认=全部；严重+关注=全部
+        # 卡片汇总：含全部确认状态，不受 ack/level 影响（类型/周期筛选仍生效）
+        # 未确认+已确认=全部；严重+关注=全部；已归档（问题已不再触发）不计入
         base = self.system.db.get_alerts(
-            acknowledged=None, alert_type=alert_type, level=None, limit=200
+            acknowledged=None, alert_type=alert_type, level=None, limit=200,
+            fiscal_period=fiscal_period,
         )
         active = [a for a in base if not int(a.get("acknowledged") or 0)]
         acked = [a for a in base if int(a.get("acknowledged") or 0)]
@@ -6880,31 +9629,37 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
             "acked": len(acked),
             "critical": len([a for a in base if a.get("level") == "critical"]),
             "warning": len([a for a in base if a.get("level") == "warning"]),
+            "fiscal_period": fiscal_period or "",
         })
 
     def _alerts_scan(self, params):
         """从 ERP/MES 扫描并刷新预警"""
         fiscal_period = params.get("fiscal_period", [None])[0]
         result = self.system.scan_quality_alerts(fiscal_period)
+        self._audit("alerts_scan", fiscal_period or "", f"added={result.get('added') or result.get('created') or ''}")
         self._ok(result)
 
     def _ack_alert(self, params):
         aid = params.get("id", [""])[0]
-        by = params.get("by", ["User"])[0]
         if not aid:
             self._err(400, "缺少id参数")
             return
+        actor, _role = self._actor()
+        by = actor if actor not in ("", "anonymous") else params.get("by", ["User"])[0]
         self.system.db.ack_alert(aid, by)
+        self._audit("alert_ack", aid, f"by={by}")
         self._ok({"message": "预警已确认", "acked": aid})
 
     def _ack_alerts_batch(self, params):
         ids_raw = params.get("ids", [""])[0] or ""
-        by = params.get("by", ["User"])[0]
         ids = [x.strip() for x in ids_raw.split(",") if x.strip()]
         if not ids:
             self._err(400, "缺少ids参数")
             return
+        actor, _role = self._actor()
+        by = actor if actor not in ("", "anonymous") else params.get("by", ["User"])[0]
         n = self.system.db.ack_alerts_batch(ids, by)
+        self._audit("alert_ack_batch", detail=f"count={n} by={by}")
         self._ok({"message": f"已确认 {n} 条", "acked": n})
 
     def _alert_create(self, body):
@@ -7038,6 +9793,7 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
     def _history_purge(self, params=None):
         """清理无实据空壳历史记录。"""
         purged = self.system.db.purge_empty_health_reports()
+        self._audit("history_purge_empty", detail=f"purged={len(purged)}")
         self._ok({"message": f"已清理空壳历史 {len(purged)} 条", "purged": purged})
 
     def _manual_learn(self, body):
@@ -7045,6 +9801,7 @@ class PCBQualityHandler(BaseHTTPRequestHandler):
         content = body.get("content", "")
         insight = body.get("insight", "")
         self.system.db.add_learning(learn_type, "manual", content, insight, 0.9)
+        self._audit("manual_learn", learn_type, f"content_len={len(str(content))}")
         self._ok({"message": "学习记录已保存"})
 
     # ─── 响应工具 ────────────────────────────────────
@@ -7111,6 +9868,16 @@ def _enforce_prod_guard():
         resolved = ctx.get("resolved") or {}
         for w in list(ctx.get("warnings") or []):
             logger.warning("[ENV] %s", w)
+        # 诚实标注：prod 仍指向 zr_aicoding 桥接副本 ≠ 生产库
+        erp_norm = str(resolved.get("erp_db_path") or "").replace("\\", "/").lower()
+        if erp_norm and (
+            "pythonproject_zr_aicoding" in erp_norm
+            or "erp_quality_bridge" in erp_norm
+            or "erp_bridge" in erp_norm
+        ):
+            msg = f"QA_ENV=prod 但 ERP/MES 指向桥接副本：{resolved.get('erp_db_path')}；对外称生产库前须改为独立生产连接器"
+            logger.warning("[ENV] %s", msg)
+            print(f"[WARN] {msg}", flush=True)
         if resolved.get("using_bridge_fallback") and not PROD_ALLOW_BRIDGE:
             msg = (
                 "生产环境仍指向桥接库，且未设置 QA_PROD_ALLOW_BRIDGE=1。"
@@ -7149,6 +9916,42 @@ def _enforce_bind_guard():
     print(f"[OK] API 令牌鉴权已启用（监听 {API_HOST}）", flush=True)
 
 
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """线程型 HTTP 服务：限制并发工作线程与监听队列，超限直接 503。"""
+
+    daemon_threads = True
+    request_queue_size = 128
+    max_workers = 64
+
+    def __init__(self, server_address, handler_cls, max_workers: int = 64):
+        super().__init__(server_address, handler_cls)
+        self.max_workers = max(1, int(max_workers))
+        self._slots = threading.BoundedSemaphore(self.max_workers)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def main():
     print("=" * 60, flush=True)
     print("  PCB智能品质分析系统 v2.0", flush=True)
@@ -7173,13 +9976,8 @@ def main():
         print("[警告] MES数据库未连接", flush=True)
 
     PCBQualityHandler.system = system
-    # 生产并发：ThreadingHTTPServer
-    try:
-        server = ThreadingHTTPServer((API_HOST, API_PORT), PCBQualityHandler)
-    except AttributeError:
-        class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-            daemon_threads = True
-        server = _ThreadedHTTPServer((API_HOST, API_PORT), PCBQualityHandler)
+    # 生产并发：有界线程池（连接队列 128 / 工作线程 64）
+    server = _BoundedThreadingHTTPServer((API_HOST, API_PORT), PCBQualityHandler)
     server.daemon_threads = True
 
     print(flush=True)
@@ -7194,13 +9992,15 @@ def main():
         print(f"  KB : {_ctx.get('resolved', {}).get('kb_path')}", flush=True)
         for w in (_ctx.get("warnings") or []):
             print(f"  [WARN] {w}", flush=True)
-        # 生产：后台周期性从 MES/ERP 生产库刷新桥接表（动态数据）
+        # 生产：后台周期性从 MES/ERP 生产库刷新桥接表（需显式 QA_BRIDGE_SYNC=1）
         if (_ctx.get("env") or "").lower() == "prod":
             try:
                 from app.bridge_sync_worker import start_bridge_sync_worker
                 erp_live = (_ctx.get("resolved") or {}).get("erp_db_path")
                 if start_bridge_sync_worker(erp_live):
                     print(f"  桥接同步: 已启用（跟生产库动态更新） db={erp_live}", flush=True)
+                else:
+                    print("  桥接同步: 未启用（如需后台刷新桥接表，请设 QA_BRIDGE_SYNC=1）", flush=True)
             except Exception as e:
                 print(f"  [WARN] 桥接同步线程未启动: {e}", flush=True)
     except Exception:
@@ -7224,7 +10024,7 @@ def main():
         if API_TOKEN:
             print("  自动化:   请求头 X-API-Token / Authorization: Bearer <QA_API_TOKEN>", flush=True)
     elif API_TOKEN:
-        print("  访问方式: 打开 /pcb_quality_system.html?token=<QA_API_TOKEN> 一次以写入 Cookie", flush=True)
+        print("  访问方式: 浏览器打开 /login.html 登录；自动化脚本携带请求头 X-API-Token", flush=True)
     print("完整部署说明见 deploy/DEPLOY.md", flush=True)
     print("按 Ctrl+C 停止服务", flush=True)
     print("=" * 60, flush=True)

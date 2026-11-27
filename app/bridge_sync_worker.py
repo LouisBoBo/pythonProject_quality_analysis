@@ -113,9 +113,9 @@ def start_bridge_sync_worker(
         except Exception:
             interval_sec = 600
 
-    # 显式关闭
-    if os.environ.get("QA_BRIDGE_SYNC", "1").strip().lower() in ("0", "false", "off", "no"):
-        logger.info("QA_BRIDGE_SYNC=0，不启动桥接同步线程")
+    # 显式开启才启动（默认关闭）：后台任务会周期性写生产库桥接表，须显式授权
+    if os.environ.get("QA_BRIDGE_SYNC", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        logger.info("QA_BRIDGE_SYNC 未设为 1，不启动桥接同步线程")
         return False
 
     with _lock:

@@ -119,8 +119,19 @@ def get_process_candidates(erp_process: str) -> List[str]:
     name = (erp_process or "").strip()
     if not name:
         return []
+    try:
+        from config.process_catalog import normalize_process_name
+        std = normalize_process_name(name) or name
+    except Exception:
+        std = name
     m = load_mapping()["process_map"]
-    return list(m.get(name) or [])
+    # 先标准名，再原始名；去重保序
+    out: List[str] = []
+    for key in (std, name):
+        for x in (m.get(key) or []):
+            if x not in out:
+                out.append(x)
+    return out
 
 
 def map_erp_defect(

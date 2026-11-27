@@ -37,6 +37,32 @@ except Exception:
 FONT_NAME = chinese_font
 
 
+def _safe_name(value: object, limit: int = 40) -> str:
+    """文件名片段：仅保留字母/数字/汉字与 -_，防止路径穿越。"""
+    text = str(value if value is not None else "").strip()
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)[:limit] or "NA"
+
+
+def _fmt_pct(value, digits: int = 2) -> str:
+    """百分比展示：None/空值显示「—」，不把「无基数/无数据」印成 0%。"""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):.{digits}f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+# 体检接口 score.scores 的维度键 → 中文名
+_DIM_LABELS = {
+    "scrap": "报废",
+    "inspection": "检验",
+    "process": "过程",
+    "complaint": "客诉",
+    "material": "原材料",
+}
+
+
 def generate_health_check_pdf(health_data, part_number, fiscal_period=None, output_path=None, output_dir=None):
     """
     生成品质体检报告PDF
@@ -55,10 +81,11 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
                 )
         os.makedirs(base_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_part = _safe_name(part_number)
         if fiscal_period:
-            filename = f"品质体检报告_{part_number}_{fiscal_period}_{timestamp}.pdf"
+            filename = f"品质体检报告_{safe_part}_{_safe_name(fiscal_period, 12)}_{timestamp}.pdf"
         else:
-            filename = f"品质体检报告_{part_number}_{timestamp}.pdf"
+            filename = f"品质体检报告_{safe_part}_{timestamp}.pdf"
         output_path = os.path.join(base_dir, filename)
 
     # macOS / Linux 中文字体回退
@@ -93,6 +120,7 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Title'],
+        fontName=FONT_NAME,
         fontSize=20,
         textColor=colors.HexColor('#1a5276'),
         spaceAfter=10,
@@ -102,6 +130,7 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     subtitle_style = ParagraphStyle(
         'CustomSubtitle',
         parent=styles['Normal'],
+        fontName=FONT_NAME,
         fontSize=12,
         textColor=colors.HexColor('#566573'),
         spaceAfter=20,
@@ -111,6 +140,7 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     section_style = ParagraphStyle(
         'SectionTitle',
         parent=styles['Heading2'],
+        fontName=FONT_NAME,
         fontSize=14,
         textColor=colors.HexColor('#1a5276'),
         spaceBefore=15,
@@ -120,6 +150,7 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     normal_style = ParagraphStyle(
         'CustomNormal',
         parent=styles['Normal'],
+        fontName=FONT_NAME,
         fontSize=10,
         leading=14
     )
@@ -133,7 +164,10 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     if fiscal_period and len(fiscal_period) == 6:
         period_str = f"{fiscal_period[:4]}年{fiscal_period[4:6]}月"
 
-    elements.append(Paragraph(f"料号: {part_number} | 周期: {period_str}", subtitle_style))
+    elements.append(Paragraph(
+        f"料号: {_pdf_escape(part_number or '—')} | 周期: {_pdf_escape(period_str)}",
+        subtitle_style,
+    ))
     elements.append(Spacer(1, 10))
 
     # 报告信息
@@ -156,10 +190,13 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     elements.append(info_table)
     elements.append(Spacer(1, 20))
 
-    # 综合评分
-    overall = health_data.get('overall', {})
-    score = overall.get('score', 0)
-    grade = overall.get('grade', 'N')
+    # 综合评分（兼容体检接口 score.* 与旧版 overall.* 两种形状）
+    overall = health_data.get('overall') or {}
+    score_obj = health_data.get('score') or {}
+    score = overall.get('score')
+    if score is None:
+        score = score_obj.get('total', 0)
+    grade = overall.get('grade') or score_obj.get('grade') or 'N'
     grade_color = {
         'A': '#27ae60',
         'B': '#2980b9',
@@ -196,17 +233,31 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     dimensions = health_data.get('dimensions', {})
 
     dim_data = [['维度', '得分', '权重', '评价']]
-    for dim_name, dim_info in dimensions.items():
-        if isinstance(dim_info, dict):
-            dim_score = dim_info.get('score', 0)
-            dim_weight = dim_info.get('weight', 0)
-            dim_level = dim_info.get('level', '一般')
-            dim_data.append([
-                dim_name,
-                f'{dim_score}分',
-                f'{dim_weight}%',
-                dim_level
-            ])
+    if dimensions:
+        for dim_name, dim_info in dimensions.items():
+            if isinstance(dim_info, dict):
+                dim_score = dim_info.get('score', 0)
+                dim_weight = dim_info.get('weight', 0)
+                dim_level = dim_info.get('level', '一般')
+                dim_data.append([
+                    dim_name,
+                    f'{dim_score}分',
+                    f'{dim_weight}%',
+                    dim_level
+                ])
+    else:
+        # 体检接口返回 score.scores（{维度键: 得分|None}）+ score.dim_max（满分）
+        dim_scores = score_obj.get('scores') or {}
+        dim_max = score_obj.get('dim_max') or {}
+        for key, val in dim_scores.items():
+            maxv = dim_max.get(key)
+            name = _DIM_LABELS.get(key, key)
+            if val is None or not maxv:
+                dim_data.append([name, '—', f'{maxv}%' if maxv else '—', '缺数据'])
+                continue
+            ratio = float(val) / float(maxv)
+            level = '良好' if ratio >= 0.85 else ('一般' if ratio >= 0.6 else '偏低')
+            dim_data.append([name, f'{int(val)}分', f'{maxv}%', level])
 
     dim_table = Table(dim_data, colWidths=[120, 80, 80, 100])
     dim_table.setStyle(TableStyle([
@@ -229,9 +280,9 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     elements.append(Paragraph("二、报废分析", section_style))
 
     scrap_info = [
-        ['总报废数量', f'{scrap.get("total_scrap_pcs", 0):,} PCS'],
-        ['总入库数量', f'{scrap.get("total_in_stock_pcs", 0):,} PCS'],
-        ['报废率', f'{scrap.get("scrap_rate", 0):.2f}%']
+        ['总报废数量', f'{int(scrap.get("total_scrap_pcs") or 0):,} PCS'],
+        ['总入库数量', f'{int(scrap.get("total_in_stock_pcs") or 0):,} PCS'],
+        ['报废率', _fmt_pct(scrap.get("scrap_rate"))]
     ]
 
     scrap_table = Table(scrap_info, colWidths=[150, 200])
@@ -259,8 +310,8 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
                 str(i),
                 defect.get('defect_type', ''),
                 defect.get('process', ''),
-                f"{defect.get('scrap_pcs', 0):,}",
-                f"{defect.get('ratio', 0):.1f}%"
+                f"{int(defect.get('scrap_pcs') or 0):,}",
+                _fmt_pct(defect.get('ratio'), 1)
             ])
 
         defect_table = Table(defect_data, colWidths=[50, 150, 100, 100, 80])
@@ -283,13 +334,13 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     elements.append(Spacer(1, 15))
     elements.append(Paragraph("三、工序良率分析", section_style))
 
-    avg_yield = process.get('avg_yield', 0)
-    min_yield = process.get('min_yield', 0)
+    avg_yield = process.get('avg_yield')
+    min_yield = process.get('min_yield')
     process_yield = process.get('process_yield', [])
 
     yield_info = [
-        ['平均良率', f'{avg_yield:.2f}%'],
-        ['最低良率', f'{min_yield:.2f}%'],
+        ['平均良率', _fmt_pct(avg_yield)],
+        ['最低良率', _fmt_pct(min_yield)],
         ['涉及工序', f'{len(process_yield)} 道']
     ]
 
@@ -309,11 +360,15 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
         elements.append(Spacer(1, 8))
         proc_data = [['工序', '良率', '状态']]
         for proc in process_yield[:15]:
-            proc_rate = proc.get('yield_rate', 0)
-            status = '正常' if proc_rate >= 90 else '预警' if proc_rate >= 80 else '异常'
+            proc_rate = proc.get('yield_rate', proc.get('PassRate'))
+            rate_text = '—' if proc_rate is None else f'{float(proc_rate):.2f}%'
+            if proc_rate is None:
+                status = '缺数据'
+            else:
+                status = '正常' if proc_rate >= 90 else '预警' if proc_rate >= 80 else '异常'
             proc_data.append([
-                proc.get('process_name', ''),
-                f'{proc_rate:.2f}%',
+                proc.get('process_name') or proc.get('ProcessName', ''),
+                rate_text,
                 status
             ])
 
@@ -346,8 +401,11 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
                 'P3': '#3498db'
             }.get(priority, '#7f8c8d')
 
-            rec_text = f"<b>[{priority}]</b> {rec.get('content', '')}"
-            elements.append(Paragraph(rec_text, normal_style))
+            rec_text = _pdf_escape(rec.get('title') or rec.get('content') or '')
+            action = rec.get('action') or ''
+            if action:
+                rec_text += f"：{_pdf_escape(action)}"
+            elements.append(Paragraph(f"<b>[{priority}]</b> {rec_text}", normal_style))
             elements.append(Spacer(1, 5))
     else:
         elements.append(Paragraph("暂无改善建议", normal_style))
@@ -389,6 +447,7 @@ def generate_health_check_pdf(health_data, part_number, fiscal_period=None, outp
     footer_style = ParagraphStyle(
         'Footer',
         parent=styles['Normal'],
+        fontName=FONT_NAME,
         fontSize=8,
         textColor=colors.HexColor('#95a5a6'),
         alignment=TA_CENTER

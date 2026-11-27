@@ -32,6 +32,9 @@ DOTENV_PATH = load_dotenv(PROJECT_ROOT / ".env")
 for _d in (DATA_DIR, LOG_DIR, OUTPUT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+# 导出目录保留策略：超过 N 天的 .pdf/.xlsx/.csv 自动清理（0=不清理）
+OUTPUT_RETENTION_DAYS = int(os.environ.get("QA_OUTPUT_RETENTION_DAYS", "30"))
+
 # ─── 服务 ───────────────────────────────────────────
 API_HOST = os.environ.get("QA_API_HOST", "127.0.0.1")
 API_PORT = int(os.environ.get("QA_API_PORT", "8765"))
@@ -48,6 +51,16 @@ CORS_ORIGIN = (os.environ.get("QA_CORS_ORIGIN") or "").strip()
 PROD_ALLOW_BRIDGE = os.environ.get("QA_PROD_ALLOW_BRIDGE", "0").strip().lower() in (
     "1", "true", "yes", "on",
 )
+# 请求体上限（字节）：默认 2MB，防止超大 JSON 占用内存
+MAX_BODY_BYTES = int(os.environ.get("QA_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+# 反向代理信任：auto=仅同机回环代理时信任 X-Real-IP/X-Forwarded-For；1=总是信任；0=从不
+TRUST_PROXY = (os.environ.get("QA_TRUST_PROXY") or "auto").strip().lower()
+# 破坏性操作管理员角色（逗号分隔）；留空=不限制（兼容现有部署）
+ADMIN_ROLES = [
+    x.strip().lower()
+    for x in (os.environ.get("QA_ADMIN_ROLES") or "").split(",")
+    if x.strip()
+]
 
 # ─── 知识库 ─────────────────────────────────────────
 KB_V1_PATH = DATA_DIR / "quality_knowledge.db"
@@ -69,7 +82,7 @@ GRAPHRAG_BASE_URL = os.environ.get(
     "QA_GRAPHRAG_URL", "http://175.178.238.31"
 ).rstrip("/")
 GRAPHRAG_TIMEOUT = float(os.environ.get("QA_GRAPHRAG_TIMEOUT", "12"))
-GRAPHRAG_CACHE_TTL = int(os.environ.get("QA_GRAPHRAG_CACHE_TTL", "300"))
+GRAPHRAG_CACHE_TTL = int(os.environ.get("QA_GRAPHRAG_CACHE_TTL", "1800"))
 
 # ─── 领导决策目标阈值（可环境变量覆盖，禁止写死在业务文案里）──
 # 报废率目标 / 警戒 / 严重；工序良率目标；用于总览对标与决策简报
@@ -106,7 +119,8 @@ ERP_AUTH_TIMEOUT = float(os.environ.get("QA_ERP_AUTH_TIMEOUT", "15"))
 REQUIRE_LOGIN = os.environ.get("QA_REQUIRE_LOGIN", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
-SESSION_TTL_SECONDS = int(os.environ.get("QA_SESSION_TTL_SECONDS", str(86400 * 7)))
+# 会话有效期默认 12 小时（可用 QA_SESSION_TTL_SECONDS 覆盖）
+SESSION_TTL_SECONDS = int(os.environ.get("QA_SESSION_TTL_SECONDS", str(86400 // 2)))
 # Cookie Secure 标记：1=强制 Secure；auto=检测到 HTTPS / X-Forwarded-Proto=https 时加 Secure
 _COOKIE_SECURE_RAW = (os.environ.get("QA_COOKIE_SECURE") or "auto").strip().lower()
 COOKIE_SECURE_MODE = _COOKIE_SECURE_RAW  # "1"/"true"/"yes" | "0"/"false" | "auto"

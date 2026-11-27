@@ -144,11 +144,32 @@ class SqliteConnector:
                     from quality_mes_bridge import sync_quality_bridge  # type: ignore
 
                     sync_quality_bridge(self.db_path)
+            self._ensure_indexes()
             self.connected = True
             return {"success": True, "db": str(self.db_path)}
         except Exception as e:
             self.connected = False
             return {"success": False, "error": str(e)}
+
+    def _ensure_indexes(self) -> None:
+        """为高频时间/周期过滤补索引（仅桥接 SQLite；只读或表不存在时跳过）。"""
+        if self._conn is None:
+            return
+        stmts = (
+            "CREATE INDEX IF NOT EXISTS ix_VPI_createdate "
+            "ON View_P_Inspection(CreateDate)",
+            "CREATE INDEX IF NOT EXISTS ix_VPI_fiscalperiod "
+            "ON View_P_Inspection(FiscalPeriod)",
+        )
+        for sql in stmts:
+            try:
+                self._conn.execute(sql)
+            except Exception as e:
+                logger.info("跳过索引创建（%s）: %s", sql, e)
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
 
     def disconnect(self) -> None:
         if self._conn is not None:
@@ -176,4 +197,5 @@ class SqliteConnector:
             if key not in _SEEN_SQL_ERRORS and len(_SEEN_SQL_ERRORS) < 200:
                 _SEEN_SQL_ERRORS.add(key)
                 logger.warning("SQL 执行失败: %s | sql=%s", e, sql[:200])
-            return {"success": False, "error": f"{e} | sql={sql[:200]}", "data": []}
+            # 不把完整 SQL 回给 API 调用方，避免结构泄露；完整片段仅写日志
+            return {"success": False, "error": str(e), "data": []}

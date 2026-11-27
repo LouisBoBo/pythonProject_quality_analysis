@@ -430,7 +430,7 @@ class TraceQueryModule(ttk.Frame):
             # 绘制图表 - 使用真实数据
             self._show_charts(data)
         else:
-            self._show_sample_data()
+            self._show_empty_state()
 
     def _show_charts(self, data):
         """使用真实数据绘制图表"""
@@ -466,10 +466,10 @@ class TraceQueryModule(ttk.Frame):
         if wo_result.get("success"):
             self._on_query_result(wo_result, trace_data.get("part", ""))
         else:
-            self._show_sample_data()
+            self._show_empty_state()
 
-    def _show_sample_data(self):
-        """显示示例数据（无真实数据时）"""
+    def _show_empty_state(self):
+        """无真实数据：清空显示，不展示估算值"""
         self.card_wo.value_label.config(text="0")
         self.card_batch.value_label.config(text="0")
         self.card_input.value_label.config(text="0")
@@ -645,8 +645,8 @@ class MRBAnalysisModule(ttk.Frame):
                 msg = f"料号 {self.query_part}: {msg}"
             messagebox.showinfo("分析完成", msg)
         else:
-            messagebox.showwarning("分析提示", result.get('error', '查询失败') + "\n\n将显示示例数据。")
-            self._show_sample_data()
+            messagebox.showwarning("分析提示", result.get('error', '查询失败') + "\n\n已清空显示，不做估算。")
+            self._show_empty_state()
 
     def _show_charts(self, data):
         """使用真实数据绘制图表"""
@@ -691,32 +691,20 @@ class MRBAnalysisModule(ttk.Frame):
         if mrb_result.get("success"):
             self._on_query_result(mrb_result)
         else:
-            self._show_sample_data()
+            self._show_empty_state()
 
-    def _show_sample_data(self):
-        """显示示例数据"""
-        self.card_scrap_area.value_label.config(text="35.6")
-        self.card_scrap_rate.value_label.config(text="2.30")
-        self.card_rework.value_label.config(text="8.2")
-        self.card_mrb_count.value_label.config(text="24")
+    def _show_empty_state(self):
+        """无数据状态：清空卡片与图表，不展示任何估算值"""
+        for card in (self.card_scrap_area, self.card_scrap_rate, self.card_rework, self.card_mrb_count):
+            card.value_label.config(text="—")
 
         for item in self.table.get_children():
             self.table.delete(item)
+        self.table.insert("", tk.END, values=("无数据（未查询或查询失败）", "", "", "", "", ""))
 
-        sample_data = [
-            ("开路", "18", "0.065", "28.6%", "28.6%", "蚀刻"),
-            ("短路", "15", "0.054", "23.8%", "52.4%", "图电"),
-            ("缺口", "10", "0.036", "15.9%", "68.3%", "成型"),
-            ("气泡", "8", "0.029", "12.7%", "81.0%", "压合"),
-            ("毛刺", "5", "0.018", "7.9%", "88.9%", "钻孔"),
-        ]
-        for row in sample_data:
-            self.table.insert("", tk.END, values=row)
-
-        self.chart_defect.draw_bar_chart(
-            [18, 15, 10, 8, 5], title="缺陷数量", labels=['开路', '短路', '缺口', '气泡', '毛刺'])
-        self.chart_respon.draw_pie_chart([35, 25, 18, 12, 10], title="责任工序", labels=['蚀刻', '钻孔', '压合', '图电', '其他'])
-        self.chart_trend.draw_line_chart([3.2, 2.8, 2.5, 2.3], title="报废率趋势 (%)", labels=['1月', '2月', '3月', '4月'], target_line=1.5)
+        self.chart_defect.draw_bar_chart([0], title="报废PCS", labels=["无数据"])
+        self.chart_respon.draw_pie_chart([1], title="报废分布", labels=["无数据"])
+        self.chart_trend.draw_line_chart([0], title="报废率 (%)", labels=["无数据"], target_line=1.5)
 
 
 class MESDataModule(ttk.Frame):
@@ -882,8 +870,8 @@ class MESDataModule(ttk.Frame):
                 msg = f"料号 {self.query_part}: {msg}"
             messagebox.showinfo("查询完成", msg)
         else:
-            messagebox.showwarning("查询提示", result.get('error', 'MES查询失败') + "\n\n将显示示例数据。")
-            self._show_sample_data()
+            messagebox.showwarning("查询提示", result.get('error', 'MES查询失败') + "\n\n已清空显示，不做估算。")
+            self._show_empty_state()
 
     def _show_charts(self, data):
         """使用真实数据绘制图表"""
@@ -940,35 +928,20 @@ class MESDataModule(ttk.Frame):
         if mes_result.get("success"):
             self._on_query_result(mes_result)
         else:
-            self._show_sample_data()
+            self._show_empty_state()
 
-    def _show_sample_data(self):
-        """显示示例数据"""
-        self.card_process.value_label.config(text="15")
-        self.card_yield.value_label.config(text="97.70")
-        self.card_oee.value_label.config(text="85")
-        self.card_chemical.value_label.config(text="3")
+    def _show_empty_state(self):
+        """无数据状态：清空卡片与图表，不展示任何估算值"""
+        for card in (self.card_process, self.card_yield, self.card_oee, self.card_chemical):
+            card.value_label.config(text="—")
 
         for item in self.table.get_children():
             self.table.delete(item)
+        self.table.insert("", tk.END, values=("无数据（未查询或查询失败）", "", "", "", "", "", ""))
 
-        sample_data = [
-            ("钻孔", "DR-001", "120", "118", "2", "98.3%", "04-01 ~ 04-10"),
-            ("沉铜板镀", "PTH-002", "118", "116", "2", "98.3%", "04-01 ~ 04-10"),
-            ("外层线路", "LDI-003", "116", "113", "3", "97.4%", "04-01 ~ 04-10"),
-            ("图电蚀刻", "ET-001", "113", "108", "5", "95.6%", "04-01 ~ 04-10"),
-        ]
-        for row in sample_data:
-            self.table.insert("", tk.END, values=row)
-
-        self.chart_yield.draw_bar_chart(
-            [98.5, 99.2, 97.8, 96.5, 97.2, 98.8, 99.5, 97.3],
-            title="工序良率 (%)",
-            labels=['钻孔', '沉铜', '线路', '蚀刻', '图电', '阻焊', '文字', '成型'])
-        self.chart_equip.draw_pie_chart([70, 15, 10, 5], title="设备状态", labels=['运行', '待机', '维护', '故障'])
-        self.chart_spc.draw_line_chart(
-            [18.2, 18.5, 18.3, 18.8, 18.6, 19.0, 18.7, 18.4, 18.9],
-            title="参数趋势", labels=['04-01', '04-02', '04-03', '04-04', '04-05', '04-06', '04-07', '04-08', '04-09'])
+        self.chart_yield.draw_bar_chart([0], title="工序良率 (%)", labels=["无数据"])
+        self.chart_equip.draw_pie_chart([1], title="设备状态", labels=["无数据"])
+        self.chart_spc.draw_line_chart([0], title="参数趋势", labels=["无数据"])
 
 
 class MaterialTraceModule(ttk.Frame):
@@ -1106,13 +1079,18 @@ class MaterialTraceModule(ttk.Frame):
             
             batch_count = len(material_lots) if material_lots else len(supplier_quality)
             supplier_count = len(supplier_quality)
-            iqc_pass_rate = data.get("iqc_pass_rate", 0)
-            trace_coverage = data.get("trace_coverage", 100)
+            iqc_sample = data.get("iqc_sample_count") or 0
+            iqc_pass_rate = data.get("iqc_pass_rate")
+            trace_coverage = data.get("trace_coverage")
 
-            self.card_batch.value_label.config(text=str(max(batch_count, 1)))
-            self.card_supplier.value_label.config(text=str(max(supplier_count, 1)))
-            self.card_iqc.value_label.config(text=f"{iqc_pass_rate:.1f}" if iqc_pass_rate else "0")
-            self.card_trace.value_label.config(text=f"{trace_coverage:.0f}" if trace_coverage else "100")
+            self.card_batch.value_label.config(text=str(batch_count))
+            self.card_supplier.value_label.config(text=str(supplier_count))
+            self.card_iqc.value_label.config(
+                text=f"{float(iqc_pass_rate):.1f}" if iqc_sample and iqc_pass_rate is not None else "—"
+            )
+            self.card_trace.value_label.config(
+                text=f"{float(trace_coverage):.0f}" if trace_coverage is not None else "—"
+            )
 
             # 填充供应商质量明细表 - 使用 supplier_quality
             if supplier_quality:
@@ -1143,8 +1121,8 @@ class MaterialTraceModule(ttk.Frame):
                 msg = f"料号 {self.query_part}: {msg}"
             messagebox.showinfo("追溯完成", msg)
         else:
-            messagebox.showwarning("追溯提示", result.get('error', '物料追溯失败') + "\n\n将显示示例数据。")
-            self._show_sample_data()
+            messagebox.showwarning("追溯提示", result.get('error', '物料追溯失败') + "\n\n已清空显示，不做估算。")
+            self._show_empty_state()
 
     def _show_charts(self, data):
         """使用真实数据绘制图表"""
@@ -1172,31 +1150,19 @@ class MaterialTraceModule(ttk.Frame):
         if mat_result.get("success"):
             self._on_query_result(mat_result)
         else:
-            self._show_sample_data()
+            self._show_empty_state()
 
-    def _show_sample_data(self):
-        """显示示例数据"""
-        self.card_batch.value_label.config(text="5")
-        self.card_supplier.value_label.config(text="3")
-        self.card_iqc.value_label.config(text="95.0")
-        self.card_trace.value_label.config(text="100")
+    def _show_empty_state(self):
+        """无数据状态：清空卡片与图表，不展示任何估算值"""
+        for card in (self.card_batch, self.card_supplier, self.card_iqc, self.card_trace):
+            card.value_label.config(text="—")
 
         for item in self.table.get_children():
             self.table.delete(item)
+        self.table.insert("", tk.END, values=("无供应商数据", "", "", "", "", "", ""))
 
-        sample_data = [
-            ("华正覆铜板", "SUP001", "100", "95", "95.0%", "A", "正常"),
-            ("南亚电子", "SUP002", "95", "91", "95.8%", "A", "正常"),
-            ("生益科技", "SUP003", "80", "76", "95.0%", "A", "正常"),
-        ]
-        for row in sample_data:
-            self.table.insert("", tk.END, values=row)
-
-        self.chart_supplier.draw_bar_chart(
-            [95.0, 95.8, 95.0], title="供应商来料合格率 (%)",
-            labels=['华正', '南亚', '生益'])
-        self.chart_material.draw_pie_chart(
-            [100, 95, 80], title="供应商来料批次", labels=['华正', '南亚', '生益'])
+        self.chart_supplier.draw_bar_chart([0], title="供应商来料合格率 (%)", labels=["无数据"])
+        self.chart_material.draw_pie_chart([1], title="供应商来料批次", labels=["无数据"])
         self._draw_chain(True)
 
 

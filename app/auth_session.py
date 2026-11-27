@@ -23,6 +23,23 @@ _LOGIN_FAILS: Dict[str, list] = {}
 _LOGIN_LOCK = threading.Lock()
 _LOGIN_WINDOW_S = 300
 _LOGIN_MAX_FAILS = 8
+# 全局上限：最多跟踪的 IP 条目数，避免大量来源 IP 撑爆内存
+_LOGIN_MAX_IPS = 4096
+
+
+def _purge_locked(now: float) -> None:
+    """清理窗口外记录；仍超全局上限时按最近失败时间淘汰最旧条目。"""
+    expired = [
+        ip for ip, hits in _LOGIN_FAILS.items()
+        if not any(now - t < _LOGIN_WINDOW_S for t in hits)
+    ]
+    for ip in expired:
+        _LOGIN_FAILS.pop(ip, None)
+    overflow = len(_LOGIN_FAILS) - _LOGIN_MAX_IPS
+    if overflow > 0:
+        oldest = sorted(_LOGIN_FAILS.items(), key=lambda kv: max(kv[1] or [0]))
+        for ip, _ in oldest[:overflow]:
+            _LOGIN_FAILS.pop(ip, None)
 
 
 def check_login_rate_limit(client_ip: str) -> Optional[str]:
@@ -30,6 +47,7 @@ def check_login_rate_limit(client_ip: str) -> Optional[str]:
     ip = (client_ip or "unknown").strip() or "unknown"
     now = time.time()
     with _LOGIN_LOCK:
+        _purge_locked(now)
         hits = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
         _LOGIN_FAILS[ip] = hits
         if len(hits) >= _LOGIN_MAX_FAILS:
@@ -41,9 +59,11 @@ def record_login_failure(client_ip: str) -> None:
     ip = (client_ip or "unknown").strip() or "unknown"
     now = time.time()
     with _LOGIN_LOCK:
+        _purge_locked(now)
         hits = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
         hits.append(now)
         _LOGIN_FAILS[ip] = hits
+        _purge_locked(now)
 
 
 def clear_login_failures(client_ip: str) -> None:

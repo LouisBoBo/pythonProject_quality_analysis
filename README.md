@@ -76,8 +76,9 @@ python run.py cli --help
 
 访问：http://localhost:8765/pcb_quality_system.html
 
-> 若 `.env` 设置了 `QA_API_TOKEN`，首次打开请带上令牌：`/pcb_quality_system.html?token=<QA_API_TOKEN>`，
-> 服务端会写入 HttpOnly Cookie，之后正常访问即可。
+> 若 `.env` 设置了 `QA_API_TOKEN`，浏览器访问请打开 `/login.html` 用 ERP/MES 账号登录；
+> 自动化脚本在请求头带 `X-API-Token: <QA_API_TOKEN>`（或 `Authorization: Bearer ...`）。
+> URL 传参 `?token=` 已禁用，避免令牌进入访问日志与浏览器历史。
 
 ## 生产部署
 
@@ -102,12 +103,21 @@ sudo systemctl restart pcb-quality
 | 知识库 | 不良模式学习与积累 |
 | PDF 导出 | 品质体检报告 |
 
+### 演示亮点（精而不多）
+
+面向领导演示的三条可复述能力（详见 [docs/项目方案-演示亮点.md](docs/项目方案-演示亮点.md)）：
+
+1. **异常料号一张卡** — TOP 料号一键看报废/主责工序/缺陷/是否建议开 8D  
+2. **闭环状态条** — 当月异常料号 → 已开 8D → 已关闭  
+3. **口径透明** — KPI 旁展开公式（报废率 = 报废/(报废+入库)，无入库不算率）
+
 ## 主要 API
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | 健康检查 |
-| GET | `/api/dashboard` | 仪表板 |
+| GET | `/api/dashboard` | 仪表板（含 closed_loop / kpi_formulas） |
+| GET | `/api/part_spotlight?part=` | 异常料号决策卡 |
 | GET | `/api/health_check?part=` | 品质体检 |
 | GET | `/api/scrap` | 报废分析 |
 | GET | `/api/process` | 工序良率 |
@@ -128,6 +138,11 @@ sudo systemctl restart pcb-quality
 | `QA_CORS_ORIGIN` | 空 | 默认仅同源；独立前端再填 Origin 或 `*` |
 | `QA_DEBUG_ERRORS` | `0` | 500 是否回传异常原文（排查用） |
 | `QA_CONNECTOR_PATHS` | — | 额外连接器搜索路径（`os.pathsep` 分隔） |
+| `QA_TRUST_PROXY` | `auto` | 反代头信任：`auto` 仅信任本机回环对端；`1` 始终信任；`0` 不信任 |
+| `QA_MAX_BODY_BYTES` | `2097152` | POST 请求体上限（字节），超限返回 413 |
+| `QA_ADMIN_ROLES` | 空 | 管理操作角色白名单（逗号分隔）；留空不限制 |
+| `QA_BRIDGE_SYNC` | `0` | `1` 时生产环境后台周期刷新桥接表（会写桥接库，须显式开启） |
+| `QA_BRIDGE_SYNC_SEC` | `600` | 桥接同步周期（秒） |
 
 ## 调试工具
 
