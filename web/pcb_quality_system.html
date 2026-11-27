@@ -75,28 +75,30 @@
   padding: 8px 14px 8px !important;
 }
 .dash-hero #chartYieldTrend {
-  flex: 1; height: auto !important; min-height: 300px;
+  flex: 1; height: auto !important; min-height: 360px; /* 与右侧双仪表总高大致对齐 */
 }
 .dash-hero #yieldTrendHint {
   margin-top: 4px !important; line-height: 1.2; flex-shrink: 0;
 }
 .dash-hero-side {
   display: flex; flex-direction: column;
-  gap: 6px;
+  gap: 10px;
   width: 100%; height: 100%;
 }
 .dash-hero-side > .card {
-  flex: 1 1 0; display: flex; flex-direction: column; min-height: 0;
+  flex: 1 1 auto; display: flex; flex-direction: column;
+  min-height: 198px; /* 外框高度保持 */
 }
 .dash-hero-side > .card > .card-header {
-  padding: 8px 14px; flex-shrink: 0;
+  padding: 2px 10px; flex-shrink: 0; /* 压缩标题区，把空间留给仪表 */
 }
 .dash-hero-side > .card > .card-body {
   flex: 1; display: flex; align-items: center; justify-content: center;
-  padding: 4px 10px 10px !important; overflow: visible;
+  padding: 0 2px 2px !important; overflow: visible;
 }
 .dash-hero-side .chart-box.sm {
-  height: 168px !important; width: 100%; min-height: 168px;
+  /* 框高不变，图表尽量铺满卡片内容区 */
+  height: 100% !important; width: 100%; min-height: 168px;
 }
 .dash-bottom-row {
   display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px;
@@ -1362,8 +1364,27 @@ function setDefaultDates(startId, endId) {
 function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  document.getElementById('page-' + name).classList.add('active');
-  document.getElementById('nav-' + name).classList.add('active');
+  const pageEl = document.getElementById('page-' + name);
+  const navEl = document.getElementById('nav-' + name);
+  if (pageEl) pageEl.classList.add('active');
+  if (navEl) navEl.classList.add('active');
+
+  // 切换菜单时重置滚动，避免沿用上一页滚动位置
+  const resetScroll = () => {
+    try {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+    } catch (e) {
+      window.scrollTo(0, 0);
+    }
+    if (document.documentElement) document.documentElement.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+    const main = document.querySelector('.main');
+    if (main) main.scrollTop = 0;
+    if (pageEl) pageEl.scrollTop = 0;
+  };
+  resetScroll();
+  // 部分页面异步渲染后高度变化，再补一次置顶
+  requestAnimationFrame(resetScroll);
 
   if (name === 'dashboard') loadDashboard();
   if (name === 'health') loadDefaultHealthCheck();
@@ -5548,54 +5569,75 @@ function renderDashDefectPie(items) {
   });
 }
 
+function _dashGaugeBase({ min, max, splitNumber, ringColors, progressColor, shadowColor, anchorColor }) {
+  return {
+    type: 'gauge',
+    // 上下留白收紧：圆心略下、半径加大，吃掉红框空白
+    center: ['50%', '58%'],
+    radius: '92%',
+    min, max, splitNumber,
+    startAngle: 210, endAngle: -30,
+    // 主刻度 + 细分刻度，刻度更密
+    axisTick: {
+      show: true, splitNumber: 4, length: 5, distance: -12,
+      lineStyle: { color: 'rgba(139,148,158,.7)', width: 1 },
+    },
+    splitLine: {
+      length: 9, distance: -12,
+      lineStyle: { color: 'rgba(201,209,217,.95)', width: 1.5 },
+    },
+    axisLabel: {
+      color: '#c9d1d9', distance: 16, fontSize: 10, fontWeight: 500,
+      formatter: (v) => String(Math.round(Number(v))),
+    },
+    axisLine: {
+      roundCap: true,
+      lineStyle: { width: 12, color: ringColors },
+    },
+    progress: {
+      show: true, width: 12, roundCap: true,
+      itemStyle: { color: progressColor, shadowBlur: 10, shadowColor },
+    },
+    pointer: {
+      length: '70%', width: 8, offsetCenter: [0, 0],
+      itemStyle: { color: '#f0f6fc', shadowBlur: 8, shadowColor: 'rgba(88,166,255,.45)' },
+    },
+    anchor: {
+      show: true, showAbove: true, size: 12,
+      itemStyle: { color: anchorColor, shadowBlur: 10, shadowColor: anchorColor },
+    },
+    animationDuration: 1400,
+  };
+}
+
 function renderDashGauge(rate) {
   const chart = ensureChart('chartScrapGauge');
   if (!chart) return;
   const unknown = (rate === null || rate === undefined);
   const val = unknown ? 0 : (Number(rate) || 0);
+  try { chart.resize(); } catch (e) {}
   chart.setOption({
     ...ECHART_DARK,
     series: [{
-      type: 'gauge',
-      center: ['50%', '58%'],
-      radius: '100%',
-      min: 0, max: 20,
-      startAngle: 210, endAngle: -30,
-      progress: {
-        show: true, width: 14, roundCap: true,
-        itemStyle: {
-          color: gradH('#3fb950', '#f85149'),
-          shadowBlur: 18, shadowColor: 'rgba(248,81,73,.35)',
-        },
-      },
-      axisLine: {
-        roundCap: true,
-        lineStyle: {
-          width: 14,
-          color: [
-            [0.1, 'rgba(63,185,80,.25)'],
-            [0.25, 'rgba(210,153,34,.25)'],
-            [1, 'rgba(248,81,73,.18)'],
-          ],
-        },
-      },
-      axisTick: { show: false },
-      splitLine: { length: 9, distance: -14, lineStyle: { color: '#8b949e', width: 1 } },
-      axisLabel: { color: '#8b949e', distance: 16, fontSize: 10 },
-      pointer: {
-        length: '58%', width: 5, offsetCenter: [0, '8%'],
-        itemStyle: { color: '#f0f6fc', shadowBlur: 8, shadowColor: 'rgba(88,166,255,.5)' },
-      },
-      anchor: { show: true, size: 10, itemStyle: { color: '#58a6ff', shadowBlur: 10, shadowColor: '#58a6ff' } },
+      ..._dashGaugeBase({
+        min: 0, max: 20, splitNumber: 10,
+        ringColors: [
+          [0.1, 'rgba(63,185,80,.28)'],
+          [0.25, 'rgba(210,153,34,.28)'],
+          [1, 'rgba(248,81,73,.2)'],
+        ],
+        progressColor: gradH('#3fb950', '#f85149'),
+        shadowColor: 'rgba(248,81,73,.25)',
+        anchorColor: '#58a6ff',
+      }),
       detail: {
         valueAnimation: true,
-        formatter: (v) => unknown ? '—' : Number(v).toFixed(2) + '%',
-        color: '#f0f6fc', fontSize: 22, fontWeight: 700,
-        offsetCenter: ['0%', '12%'],
+        formatter: () => unknown ? '—' : Number(val).toFixed(2) + '%',
+        color: '#f0f6fc', fontSize: 20, fontWeight: 700,
+        offsetCenter: [0, '26%'],
       },
-      title: { show: true, offsetCenter: ['0%', '34%'], color: '#8b949e', fontSize: 12 },
+      title: { show: true, offsetCenter: [0, '46%'], color: '#8b949e', fontSize: 11 },
       data: [{ value: val, name: '报废率' }],
-      animationDuration: 1700,
     }],
   }, true);
 }
@@ -5607,49 +5649,29 @@ function renderDashYieldGauge(latest, avg) {
   const v = unknown ? 0 : Math.max(0, Math.min(100, Number(latest) || 0));
   const avgV = Math.max(0, Math.min(100, Number(avg) || 0));
   const color = v >= 98 ? '#3fb950' : v >= 90 ? '#d29922' : '#f85149';
+  try { chart.resize(); } catch (e) {}
   chart.setOption({
     ...ECHART_DARK,
     series: [{
-      type: 'gauge',
-      center: ['50%', '58%'],
-      radius: '100%',
-      min: 70, max: 100,
-      startAngle: 210, endAngle: -30,
-      progress: {
-        show: true, width: 14, roundCap: true,
-        itemStyle: {
-          color: gradH('#f85149', '#3fb950'),
-          shadowBlur: 18, shadowColor: color + '66',
-        },
-      },
-      axisLine: {
-        roundCap: true,
-        lineStyle: {
-          width: 14,
-          color: [
-            [0.33, 'rgba(248,81,73,.22)'],
-            [0.66, 'rgba(210,153,34,.22)'],
-            [1, 'rgba(63,185,80,.22)'],
-          ],
-        },
-      },
-      axisTick: { show: false },
-      splitLine: { length: 9, distance: -14, lineStyle: { color: '#8b949e', width: 1 } },
-      axisLabel: { color: '#8b949e', distance: 16, fontSize: 10 },
-      pointer: {
-        length: '50%', width: 5,
-        itemStyle: { color: '#f0f6fc', shadowBlur: 8, shadowColor: 'rgba(88,166,255,.45)' },
-      },
-      anchor: { show: true, size: 10, itemStyle: { color, shadowBlur: 10, shadowColor: color } },
+      ..._dashGaugeBase({
+        min: 70, max: 100, splitNumber: 10,
+        ringColors: [
+          [0.33, 'rgba(248,81,73,.24)'],
+          [0.66, 'rgba(210,153,34,.24)'],
+          [1, 'rgba(63,185,80,.24)'],
+        ],
+        progressColor: gradH('#f85149', '#3fb950'),
+        shadowColor: color + '55',
+        anchorColor: color,
+      }),
       detail: {
         valueAnimation: true,
-        formatter: (val) => unknown ? '—' : Number(val).toFixed(1) + '%',
-        color: '#f0f6fc', fontSize: 22, fontWeight: 700,
-        offsetCenter: ['0%', '10%'],
+        formatter: () => unknown ? '—' : Number(v).toFixed(1) + '%',
+        color: '#f0f6fc', fontSize: 20, fontWeight: 700,
+        offsetCenter: [0, '26%'],
       },
-      title: { show: true, offsetCenter: ['0%', '32%'], color: '#8b949e', fontSize: 12 },
+      title: { show: true, offsetCenter: [0, '46%'], color: '#8b949e', fontSize: 11 },
       data: [{ value: v, name: `MES趋势均值 ${avgV.toFixed(1)}%` }],
-      animationDuration: 1700,
     }],
   }, true);
 }

@@ -138,10 +138,10 @@ body {
 }
 .form-pane::before {
   content: "";
-  position: absolute; inset: 8% 10% 8% 0; border-radius: 24px 0 0 24px;
+  position: absolute; inset: 8% 8%; border-radius: 24px;
   background: linear-gradient(180deg, rgba(22,27,34,.55), rgba(13,17,23,.35));
-  border: 1px solid rgba(48,54,61,.65); border-right: none;
-  box-shadow: -20px 0 60px rgba(0,0,0,.25);
+  border: 1px solid rgba(48,54,61,.65);
+  box-shadow: 0 0 60px rgba(0,0,0,.25);
   pointer-events: none;
 }
 .card {
@@ -212,11 +212,6 @@ body {
 }
 .btn-login.loading .spin { display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.card-foot {
-  margin-top: 18px; text-align: center; color: var(--text2); font-size: 12px; line-height: 1.5;
-}
-.card-foot code { color: var(--blue); font-size: 11px; }
-
 @media (max-width: 960px) {
   .stage { grid-template-columns: 1fr; }
   .brand-pane { min-height: auto; padding: 28px 22px 12px; }
@@ -301,11 +296,6 @@ body {
       <button class="btn-login" id="btnLogin" type="submit">
         <span class="spin"></span><span id="btnText">登 录</span>
       </button>
-
-      <div class="card-foot">
-        登录将校验 ERP/MES <code>/api/auth/login</code><br>
-        会话安全保存在本系统 Cookie，关闭浏览器后仍可保持登录
-      </div>
     </form>
   </section>
 </div>
